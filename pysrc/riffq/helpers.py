@@ -1,11 +1,43 @@
-"""Helper utilities for building Arrow results.
+"""Helper utilities for building Arrow results and deriving catalog OIDs.
 
-Currently provides `to_arrow` for constructing an Arrow C Stream from a simple
-schema description and row data. This is handy for small, programmatic results
-without depending on a database engine.
+Provides `to_arrow` for constructing an Arrow C Stream from a simple schema
+description and row data (handy for small, programmatic results without
+depending on a database engine), and `stable_oid` for deriving reproducible
+PostgreSQL object identifiers for lazy-catalog sources.
 """
 
 import pyarrow as pa
+
+# PostgreSQL reserves OIDs below 16384 for its own built-in objects. Derived
+# OIDs must stay above this floor so they can never collide with a built-in one.
+FIRST_USER_OID = 16384
+
+
+def stable_oid(salt: str, *parts: str) -> int:
+    """Derive a stable, above-the-built-in-range OID from a name.
+
+    The same ``salt`` and ``parts`` always return the same OID, so identifiers
+    that must agree across independent catalog scans -- ``pg_class.oid`` and the
+    ``pg_attribute.attrelid`` that references it, for instance -- stay consistent
+    and catalog joins resolve. Distinct object classes should pass distinct
+    salts (for example ``"db"``, ``"ns"``, ``"rel"``) so a database and a table
+    that happen to share a name do not land on the same OID. The result is always
+    at or above ``FIRST_USER_OID``, keeping it clear of PostgreSQL's built-in
+    OID range.
+
+    Args:
+        salt: A short tag identifying the object class, mixed into the hash so
+            different classes with the same name produce different OIDs.
+        parts: The name components that identify the object within its class,
+            such as ``(database, schema, relation)`` for a table.
+
+    Returns:
+        A deterministic OID in the range ``[FIRST_USER_OID, FIRST_USER_OID + 2e9)``.
+    """
+    accumulator = 5381
+    for character in (salt + "\x00" + "\x00".join(parts)):
+        accumulator = (accumulator * 33 + ord(character)) & 0x7FFFFFFF
+    return FIRST_USER_OID + (accumulator % 2_000_000_000)
 
 _type = {
     "int": pa.int64(),

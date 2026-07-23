@@ -1564,7 +1564,6 @@ dependencies = [
 [[package]]
 name = "datafusion_pg_catalog"
 version = "0.1.0"
-source = "git+https://github.com/ybrs/pg_catalog?rev=984e4962e977058fba33516e69e89a347683afcf#984e4962e977058fba33516e69e89a347683afcf"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2903,6 +2902,7 @@ version = "0.28.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91fd8e38a3b50ed1167fb981cd6fd60147e091784c427b8f7183a7ee32c31c12"
 dependencies = [
+ "chrono",
  "libc",
  "once_cell",
  "portable-atomic",
@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "riffq"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "arrow",
  "arrow-schema",

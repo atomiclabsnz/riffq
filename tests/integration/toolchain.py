@@ -1,0 +1,198 @@
+"""Locate the driver toolchain and gate the integration tests on its presence.
+
+setup_toolchain.sh builds and downloads everything into ``.toolchain/`` next to
+this file. This module turns that directory into typed locators (the ODBC
+drivers, the JDK, the pgjdbc jar, the optional SQL Workbench/J jar), the runtime
+environment the ODBC driver manager needs, and ``unittest`` skip decorators whose
+messages name the exact missing artifact and point at the setup script. When the
+toolchain is absent -- as on a bare machine -- the integration tests skip in one
+line each and ``make test`` stays green.
+
+Runtime environment note: the pyodbc wheel loads ``libodbc.so.2`` at process
+start via the dynamic loader, which reads ``LD_LIBRARY_PATH`` once at startup and
+does not re-read it if the variable is changed in-process. So this module cannot
+simply set ``os.environ`` before ``import pyodbc``; instead, on import it
+re-executes the Python process with our unixODBC library directory on
+``LD_LIBRARY_PATH`` (and ``ODBCSYSINI`` / ``ODBCINI`` pointing at our driver
+config) when they are not already in effect. ``make integration-test`` sets the
+same variables up front, so no re-exec happens there; the re-exec only makes
+ad-hoc invocations (running one test module directly) work too.
+"""
+import os
+import sys
+import unittest
+
+TOOLCHAIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".toolchain")
+
+UNIXODBC_LIB = os.path.join(TOOLCHAIN_DIR, "unixodbc", "lib")
+PSQLODBC_UNICODE = os.path.join(TOOLCHAIN_DIR, "psqlodbc", "lib", "psqlodbcw.so")
+PSQLODBC_ANSI = os.path.join(TOOLCHAIN_DIR, "psqlodbc", "lib", "psqlodbca.so")
+ODBC_ETC = os.path.join(TOOLCHAIN_DIR, "etc")
+ODBCINST_INI = os.path.join(ODBC_ETC, "odbcinst.ini")
+
+JAVA = os.path.join(TOOLCHAIN_DIR, "jdk", "bin", "java")
+JAVAC = os.path.join(TOOLCHAIN_DIR, "jdk", "bin", "javac")
+PGJDBC_JAR = os.path.join(TOOLCHAIN_DIR, "jars", "postgresql.jar")
+SQLWORKBENCH_JAR = os.path.join(TOOLCHAIN_DIR, "sqlworkbench", "sqlworkbench.jar")
+
+# The odbcinst.ini names of the two driver flavours the setup script registers.
+ODBC_UNICODE_DRIVER = "PostgreSQL Unicode"
+ODBC_ANSI_DRIVER = "PostgreSQL ANSI"
+
+# The two ODBC driver flavours the tests register and exercise, keyed by the
+# name each is registered under in odbcinst.ini.
+ODBC_DRIVERS = {
+    ODBC_UNICODE_DRIVER: PSQLODBC_UNICODE,
+    ODBC_ANSI_DRIVER: PSQLODBC_ANSI,
+}
+
+# Marker so the re-exec below happens at most once per process tree.
+_REEXEC_MARKER = "RIFFQ_INTEGRATION_ENV_APPLIED"
+
+_SETUP_HINT = "run tests/integration/setup_toolchain.sh"
+
+
+def has_odbc():
+    """Return True when both ODBC drivers and their registration file exist."""
+    return (
+        os.path.exists(PSQLODBC_UNICODE)
+        and os.path.exists(PSQLODBC_ANSI)
+        and os.path.exists(ODBCINST_INI)
+    )
+
+
+def has_jdbc():
+    """Return True when the JDK and the pgjdbc jar are both present."""
+    return os.path.exists(JAVAC) and os.path.exists(JAVA) and os.path.exists(PGJDBC_JAR)
+
+
+def has_jdbc_tool():
+    """Return True when the optional SQL Workbench/J jar is present."""
+    return os.path.exists(SQLWORKBENCH_JAR)
+
+
+def require_odbc():
+    """Skip decorator for tests needing the ODBC toolchain, naming what is missing."""
+    return unittest.skipUnless(
+        has_odbc(), f"ODBC toolchain (psqlodbc) not installed; {_SETUP_HINT}"
+    )
+
+
+def require_jdbc():
+    """Skip decorator for tests needing the JDBC toolchain, naming what is missing."""
+    return unittest.skipUnless(
+        has_jdbc(), f"JDBC toolchain (JDK + pgjdbc) not installed; {_SETUP_HINT}"
+    )
+
+
+def require_jdbc_tool():
+    """Skip decorator for the optional SQL Workbench/J tier."""
+    return unittest.skipUnless(
+        has_jdbc_tool(),
+        f"SQL Workbench/J not installed; {_SETUP_HINT} --with-jdbc-tool",
+    )
+
+
+def odbc_connection_string(port, driver="PostgreSQL Unicode", database="memory"):
+    """Build a DSN-less ODBC connection string for a fixture server.
+
+    Using a DSN-less string (naming the driver inline) rather than a configured
+    data source lets each test class point at its own port without editing a
+    shared odbc.ini.
+
+    Args:
+        port: The fixture server's TCP port.
+        driver: The odbcinst.ini driver name ("PostgreSQL Unicode" or
+            "PostgreSQL ANSI").
+        database: The database to connect to; defaults to the fixture's.
+
+    Returns:
+        An ODBC connection string suitable for pyodbc.connect.
+    """
+    # BoolsAsChar=0 makes psqlodbc map pg bool to SQL_BIT so pyodbc returns a
+    # real Python bool rather than its default '1'/'0' string.
+    return (
+        f"DRIVER={{{driver}}};SERVER=127.0.0.1;PORT={port};"
+        f"DATABASE={database};UID=user;PWD=secret;BoolsAsChar=0"
+    )
+
+
+def connect_odbc(port, driver=ODBC_UNICODE_DRIVER, database="memory"):
+    """Open an autocommit pyodbc connection configured for narrow-char decoding.
+
+    pyodbc defaults to fetching character data as wide characters (SQL_C_WCHAR),
+    which the narrow psqlodbc ANSI driver cannot produce -- it fails at SQLGetData
+    with "Received an unsupported type from Postgres". Setting UTF-8 decoding for
+    both SQL_CHAR and SQL_WCHAR makes pyodbc fetch narrow, so the ANSI driver
+    reads text correctly; it is harmless for the Unicode driver. This is the
+    correct pyodbc configuration for an ANSI ODBC driver, not a server concern.
+
+    Args:
+        port: The fixture server's TCP port.
+        driver: The odbcinst.ini driver name.
+        database: The database to connect to.
+
+    Returns:
+        An open, autocommit pyodbc connection.
+    """
+    import pyodbc
+
+    connection = pyodbc.connect(
+        odbc_connection_string(port, driver=driver, database=database), autocommit=True
+    )
+    connection.setdecoding(pyodbc.SQL_CHAR, encoding="utf-8")
+    connection.setdecoding(pyodbc.SQL_WCHAR, encoding="utf-8")
+    return connection
+
+
+def format_query_log_tail(log_path, limit=15):
+    """Return the last ``limit`` lines of the server query log for a failure message.
+
+    The fixture server records each data-path statement and whether it errored;
+    showing the tail on an assertion failure names the driver query that broke,
+    which is otherwise invisible from the client side.
+    """
+    try:
+        with open(log_path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return "(no query log)"
+    tail = lines[-limit:]
+    return "".join(tail).rstrip() or "(query log empty)"
+
+
+def _reexec_with_runtime_env():
+    """Re-run the current process with the ODBC runtime environment applied.
+
+    Prepends our unixODBC lib directory to LD_LIBRARY_PATH so the pyodbc wheel
+    resolves our libodbc.so.2, and points ODBCSYSINI / ODBCINI at our driver
+    config so no user-level ODBC file is consulted. Does nothing when the ODBC
+    toolchain is absent (tests skip) or when the environment is already applied
+    -- guarded by a marker variable to avoid an exec loop.
+    """
+    if os.environ.get(_REEXEC_MARKER):
+        return
+    if not has_odbc():
+        return
+
+    library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    already_on_path = UNIXODBC_LIB in library_path.split(os.pathsep)
+    if already_on_path:
+        # Env was set up front (e.g. by make integration-test); just mark it.
+        os.environ[_REEXEC_MARKER] = "1"
+        return
+
+    child_env = dict(os.environ)
+    child_env[_REEXEC_MARKER] = "1"
+    child_env["LD_LIBRARY_PATH"] = (
+        UNIXODBC_LIB + (os.pathsep + library_path if library_path else "")
+    )
+    child_env["ODBCSYSINI"] = ODBC_ETC
+    child_env["ODBCINI"] = os.path.join(ODBC_ETC, "odbc.ini")
+    # sys.orig_argv preserves the exact original interpreter command (including
+    # "-m unittest"), so the re-executed process runs the same thing this one
+    # was started with, only with the ODBC runtime environment in place.
+    os.execve(sys.executable, [sys.executable] + sys.orig_argv[1:], child_env)
+
+
+_reexec_with_runtime_env()

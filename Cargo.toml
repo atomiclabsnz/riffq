@@ -16,7 +16,7 @@ incremental = true
 codegen-units = 4
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.28", features = ["extension-module", "chrono"] }
 
 pgwire = "0.40.0"
 # pgwire = { git = "https://github.com/ybrs/pgwire", branch = "expose-sni", package = "pgwire" }
@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
 hex = "0.4.3"
-postgres-types = "0.2"
+postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
@@ -37,9 +37,11 @@ sqlparser = "0.62"
 chrono = "0.4.41"
 log = "0.4"
 datafusion = "54.0.0"
-# Pinned to a pg_catalog main commit (DataFusion 54). Bump the rev to pull in
-# newer pg_catalog changes.
-datafusion_pg_catalog = { git = "https://github.com/ybrs/pg_catalog", rev = "984e4962e977058fba33516e69e89a347683afcf", package = "datafusion_pg_catalog" }
+# TEMPORARY (local development): build against the local pg_catalog checkout so
+# fixes can be tested before they are pushed. Restore the git rev dependency
+# below after the pg_catalog changes are committed/pushed and pick the new rev.
+datafusion_pg_catalog = { path = "../pg_catalog", package = "datafusion_pg_catalog" }
+# datafusion_pg_catalog = { git = "https://github.com/ybrs/pg_catalog", rev = "984e4962e977058fba33516e69e89a347683afcf", package = "datafusion_pg_catalog" }
 
 env_logger = "0.11.8"
 

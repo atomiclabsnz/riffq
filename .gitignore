@@ -15,3 +15,8 @@ docs-site/
 
 # TLS material certbot writes here - a live private key, never in the repo
 teleduck/certs/
+
+# Driver integration-test toolchain (built/downloaded by setup_toolchain.sh) and
+# compiled Java harness classes; both are regenerated locally, never committed.
+tests/integration/.toolchain/
+tests/integration/java/*.class

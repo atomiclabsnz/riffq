@@ -19,6 +19,13 @@ pub fn _debug_parameters(params: &[Option<Bytes>], types: &[Type]) -> String {
                     &Type::TEXT | &Type::VARCHAR | &Type::BPCHAR => {
                         String::from_sql(ty, &mut buf).map(|s| format!("{:?}", s))
                     }
+                    &Type::BOOL => bool::from_sql(ty, &mut buf).map(|v| v.to_string()),
+                    &Type::TIMESTAMP => {
+                        chrono::NaiveDateTime::from_sql(ty, &mut buf).map(|v| v.to_string())
+                    }
+                    &Type::TIMESTAMPTZ => {
+                        chrono::DateTime::<chrono::Utc>::from_sql(ty, &mut buf).map(|v| v.to_string())
+                    }
                     _ => Err("unsupported type".into()),
                 };
                 decoded.unwrap_or_else(|_| format!("0x{}", hex::encode(bytes)))

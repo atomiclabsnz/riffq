@@ -23,6 +23,7 @@ import logging
 
 import pyarrow as pa
 import riffq
+from riffq.helpers import stable_oid
 
 logging.basicConfig(level=logging.INFO)
 
@@ -40,20 +41,6 @@ CATALOG = {
 
 # pg_type OIDs the example understands, keyed by a coarse type name.
 TYPE_OIDS = {"int": 23, "bigint": 20, "text": 25, "bool": 16, "float": 701}
-
-
-def stable_oid(salt: str, *parts: str) -> int:
-    """Derive a stable, built-in-clear OID from a name.
-
-    The same inputs always return the same OID, so ``pg_class.oid`` and
-    ``pg_attribute.attrelid`` agree across scans and catalog joins resolve.
-    Distinct object classes use distinct salts to avoid collisions, and the
-    result is kept well above the built-in OID range.
-    """
-    h = 5381
-    for ch in (salt + "\x00" + "\x00".join(parts)):
-        h = (h * 33 + ord(ch)) & 0x7FFFFFFF
-    return 16384 + (h % 2_000_000_000)
 
 
 class DictCatalogSource:

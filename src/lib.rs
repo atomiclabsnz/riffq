@@ -86,6 +86,55 @@ use sqlparser::parser::Parser;
 /// PostgreSQL version reported to clients during startup and via `SHOW server_version`.
 pub const SERVER_VERSION: &str = "17.4.0";
 
+/// Convert a Rust value pyo3 can turn into a Python object into a `Bound<PyAny>`,
+/// returning None if the conversion fails.
+fn param_to_py<'py, T: pyo3::IntoPyObject<'py>>(
+    py: Python<'py>,
+    value: T,
+) -> Option<Bound<'py, PyAny>> {
+    use pyo3::IntoPyObjectExt;
+    value.into_bound_py_any(py).ok()
+}
+
+/// Decode one bound extended-protocol parameter into a Python object.
+///
+/// The binary representation for the parameter's declared PostgreSQL type is
+/// tried first -- this is what psycopg and pgjdbc send for their typed
+/// parameters. When the type is unknown or the binary decode fails, the bytes
+/// are read as UTF-8 text and returned as a string instead: text-format
+/// parameters, and parameters a client leaves untyped (type OID 0), arrive this
+/// way -- pgjdbc's bound booleans and timestamps and every psqlodbc parameter
+/// among them -- and the backend coerces the string to the column's type.
+/// Returns None when neither decode succeeds.
+fn decode_param<'py>(py: Python<'py>, bytes: &[u8], ty: &Type) -> Option<Bound<'py, PyAny>> {
+    // A copy of the slice so a binary decode that advances it does not consume
+    // the bytes the text fallback re-reads.
+    let mut buf = bytes;
+    let decoded = match ty {
+        &Type::INT2 => i16::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v)),
+        &Type::INT4 => i32::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v)),
+        &Type::INT8 => i64::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v)),
+        &Type::FLOAT4 => f32::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v)),
+        &Type::FLOAT8 => f64::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v)),
+        &Type::TEXT | &Type::VARCHAR | &Type::BPCHAR => {
+            String::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v))
+        }
+        &Type::BOOL => bool::from_sql(ty, &mut buf).ok().and_then(|v| param_to_py(py, v)),
+        &Type::TIMESTAMP => chrono::NaiveDateTime::from_sql(ty, &mut buf)
+            .ok()
+            .and_then(|v| param_to_py(py, v)),
+        &Type::TIMESTAMPTZ => chrono::DateTime::<chrono::Utc>::from_sql(ty, &mut buf)
+            .ok()
+            .and_then(|v| param_to_py(py, v)),
+        _ => None,
+    };
+    decoded.or_else(|| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| param_to_py(py, text.to_string()))
+    })
+}
+
 pub enum WorkerMessage {
     Query {
         query: String,
@@ -873,84 +922,27 @@ impl PythonWorker {
                                     // Connection identifier
                                     kwargs.set_item("connection_id", connection_id).unwrap();
 
-                                    // Add query_args if present
-                                    if let (Some(params), Some(param_types)) =
-                                        (&params, &param_types)
-                                    {
+                                    // Add query_args if present. Iterate the values
+                                    // (not a zip with the types): a client may send
+                                    // more values than declared types -- psqlodbc
+                                    // sends parameter values with no types at all --
+                                    // and every value must still reach the handler.
+                                    // A value with no declared type is decoded as
+                                    // Type::UNKNOWN, which decode_param reads as text.
+                                    if let Some(params) = &params {
                                         let py_args = PyList::empty(py);
-                                        for (val, ty) in params.iter().zip(param_types.iter()) {
-                                            match val {
-                                                None => {
-                                                    py_args.append(py.None()).unwrap();
-                                                }
-                                                Some(bytes) => {
-                                                    let mut buf = &bytes[..];
-                                                    match ty {
-                                                        &Type::INT2 => {
-                                                            if let Ok(v) =
-                                                                i16::from_sql(ty, &mut buf)
-                                                            {
-                                                                py_args.append(v).unwrap();
-                                                            } else {
-                                                                py_args.append(py.None()).unwrap();
-                                                            }
-                                                        }
-                                                        &Type::INT4 => {
-                                                            if let Ok(v) =
-                                                                i32::from_sql(ty, &mut buf)
-                                                            {
-                                                                py_args.append(v).unwrap();
-                                                            } else {
-                                                                py_args.append(py.None()).unwrap();
-                                                            }
-                                                        }
-                                                        &Type::INT8 => {
-                                                            if let Ok(v) =
-                                                                i64::from_sql(ty, &mut buf)
-                                                            {
-                                                                py_args.append(v).unwrap();
-                                                            } else {
-                                                                py_args.append(py.None()).unwrap();
-                                                            }
-                                                        }
-                                                        &Type::FLOAT4 => {
-                                                            if let Ok(v) =
-                                                                f32::from_sql(ty, &mut buf)
-                                                            {
-                                                                py_args.append(v).unwrap();
-                                                            } else {
-                                                                py_args.append(py.None()).unwrap();
-                                                            }
-                                                        }
-                                                        &Type::FLOAT8 => {
-                                                            if let Ok(v) =
-                                                                f64::from_sql(ty, &mut buf)
-                                                            {
-                                                                py_args.append(v).unwrap();
-                                                            } else {
-                                                                py_args.append(py.None()).unwrap();
-                                                            }
-                                                        }
-                                                        &Type::TEXT
-                                                        | &Type::VARCHAR
-                                                        | &Type::BPCHAR => {
-                                                            if let Ok(v) =
-                                                                String::from_sql(ty, &mut buf)
-                                                            {
-                                                                py_args.append(v).unwrap();
-                                                            } else {
-                                                                py_args.append(py.None()).unwrap();
-                                                            }
-                                                        }
-                                                        _ => {
-                                                            info!(
-                                                                "unknown query argument type {:}?",
-                                                                ty
-                                                            );
-                                                            py_args.append(py.None()).unwrap();
-                                                        }
-                                                    }
-                                                }
+                                        for (index, val) in params.iter().enumerate() {
+                                            let ty = param_types
+                                                .as_ref()
+                                                .and_then(|types| types.get(index))
+                                                .unwrap_or(&Type::UNKNOWN);
+                                            let decoded = match val {
+                                                None => None,
+                                                Some(bytes) => decode_param(py, &bytes[..], ty),
+                                            };
+                                            match decoded {
+                                                Some(obj) => py_args.append(obj).unwrap(),
+                                                None => py_args.append(py.None()).unwrap(),
                                             }
                                         }
 

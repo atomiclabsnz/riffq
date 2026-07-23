@@ -44,7 +44,11 @@ pub fn arrow_type_to_pgwire(dt: &DataType) -> Type {
 
         /* ── booleans / strings / bytes ─────────── */
         Boolean => Type::BOOL,
-        Utf8 | LargeUtf8 | Utf8View => Type::VARCHAR,
+        // Advertise strings as text (OID 25), the type PostgreSQL itself reports
+        // for text columns and string literals, rather than varchar (1043). Both
+        // encode identically on the wire, but the psqlodbc ANSI driver rejects a
+        // varchar with no type modifier ("unsupported type") while accepting text.
+        Utf8 | LargeUtf8 | Utf8View => Type::TEXT,
         Binary | LargeBinary | FixedSizeBinary(_) => Type::BYTEA,
 
         /* ── temporal ───────────────────────────── */
@@ -126,9 +130,9 @@ mod tests {
     #[test]
     fn test_arrow_type_to_pgwire_misc() {
         assert_eq!(arrow_type_to_pgwire(&DataType::Boolean), Type::BOOL);
-        assert_eq!(arrow_type_to_pgwire(&DataType::Utf8), Type::VARCHAR);
-        assert_eq!(arrow_type_to_pgwire(&DataType::LargeUtf8), Type::VARCHAR);
-        assert_eq!(arrow_type_to_pgwire(&DataType::Utf8View), Type::VARCHAR);
+        assert_eq!(arrow_type_to_pgwire(&DataType::Utf8), Type::TEXT);
+        assert_eq!(arrow_type_to_pgwire(&DataType::LargeUtf8), Type::TEXT);
+        assert_eq!(arrow_type_to_pgwire(&DataType::Utf8View), Type::TEXT);
         assert_eq!(arrow_type_to_pgwire(&DataType::Date32), Type::DATE);
         assert_eq!(arrow_type_to_pgwire(&DataType::Date64), Type::DATE);
         assert_eq!(
