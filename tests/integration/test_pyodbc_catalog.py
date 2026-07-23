@@ -101,11 +101,12 @@ class PyodbcCatalogTest(FixtureServerCase):
     def test_primary_keys_are_empty_not_error(self):
         """KNOWN GAP (deferred): SQLPrimaryKeys errors instead of returning empty.
 
-        The driver's query accesses an inline (_pg_expandarray(...)).n
-        set-returning function field that pg_catalog's SRF-to-unnest rewrite does
-        not yet handle in this position (same root cause as the JDBC
-        getPrimaryKeys gap). The correct result for a backend with no constraints
-        is an empty set; a driver that errors here breaks table introspection.
+        psqlodbc's SQLPrimaryKeys uses a different (information_schema
+        key-column-usage) query than JDBC getPrimaryKeys -- the JDBC path is
+        fixed, but the ODBC query fails on a separate pg_catalog gap (a type
+        coercion the planner rejects). The correct result for a backend with no
+        constraints is an empty set; a driver that errors here breaks table
+        introspection.
         """
         conn = connect_odbc(self.PORT)
         try:
@@ -120,8 +121,10 @@ class PyodbcCatalogTest(FixtureServerCase):
     def test_statistics_are_empty_not_error(self):
         """KNOWN GAP (deferred): SQLStatistics errors instead of returning empty.
 
-        Same _pg_expandarray inline set-returning-function rewrite gap as the
-        primary-keys case above.
+        psqlodbc's SQLStatistics query selects i.indisprimary without grouping
+        it; DataFusion rejects the reference as not in GROUP BY (Postgres allows
+        it via functional dependency). A separate pg_catalog gap from the JDBC
+        _pg_expandarray one.
         """
         conn = connect_odbc(self.PORT)
         try:

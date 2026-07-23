@@ -98,16 +98,13 @@ class JdbcMetadataTest(FixtureServerCase):
         names = sorted(table["name"] for table in self.meta["tables"])
         self.assertEqual(names, sorted(fixture_dataset.TABLE_NAMES))
 
-    @unittest.expectedFailure
     def test_primary_keys_are_empty_not_error(self):
-        """KNOWN GAP (deferred): getPrimaryKeys errors instead of returning empty.
+        """getPrimaryKeys returns empty (the fixture has no primary keys).
 
-        Its query accesses an inline (_pg_expandarray(i.indkey)).n set-returning
-        function field; pg_catalog's SRF-to-unnest rewrite handles the bare
-        aliased form but not this inline field access in the same SELECT, so the
-        access reaches DataFusion on a List(Struct) value and errors. Deferred:
-        the fix is in a delicate multi-pass rewrite. The harness records -1 for a
-        failed call and 0 for an empty one.
+        Its query both aliases a set-returning function (_pg_expandarray(indkey)
+        AS keys) and accesses its fields inline ((_pg_expandarray(indkey)).n);
+        pg_catalog's SRF-to-unnest rewrite now routes both through one unnested
+        column. The harness records -1 for a failed call and 0 for an empty one.
         """
         self.assertEqual(
             [self.meta["primaryKeys"][table] for table in fixture_dataset.TABLE_NAMES],
