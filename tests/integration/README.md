@@ -88,27 +88,17 @@ reported by unittest as an unexpected success, which is the signal to promote it
 back to a plain assertion. These are follow-up work in riffq / pg_catalog, not
 test bugs.
 
-The gaps the first version of this suite found for the ANSI driver, `getTables`,
-`getImportedKeys` / `getIndexInfo`, and boolean/timestamp / ODBC parameter
-binding have since been fixed; only the two below remain, and both are
-deliberately deferred.
+The gaps the first versions of this suite found -- for the ANSI driver,
+`getTables`, `getImportedKeys` / `getIndexInfo`, `getPrimaryKeys`, `getTypeInfo`,
+and boolean/timestamp / ODBC parameter binding -- have since been fixed. Only the
+one below remains.
 
-1. Primary-key / statistics introspection errors instead of returning empty.
-   - Calls: JDBC `getPrimaryKeys`; ODBC `SQLPrimaryKeys` and `SQLStatistics`.
-   - Symptom: `ERROR: ... Cannot access field ... type List(Struct("x", "n")) is
-     not Struct` -- the query accesses an inline `(_pg_expandarray(indkey)).n`
-     set-returning-function field.
-   - Cause: pg_catalog's SRF-to-unnest rewrite handles a bare aliased
-     `_pg_expandarray(...)` but not this inline field access in the same SELECT,
-     so the access reaches DataFusion on a `List(Struct)` value. The correct
-     answer for a backend with no keys is an empty result set. Deferred: the fix
-     is in a delicate multi-pass sqlparser rewrite. Tests: the
-     `*_are_empty_not_error` cases in `test_pyodbc_catalog` and
-     `test_jdbc_metadata`.
-
-2. JDBC `getTypeInfo` errors.
-   - Call: pgjdbc `DatabaseMetaData.getTypeInfo`.
-   - Symptom: `ERROR: ... Correlated scalar subquery must be aggregated to return
-     at most one row` (a DataFusion limitation; ties into the corr-subq-udf-rs
-     project). The ODBC `SQLGetTypeInfo` query differs and works.
-   - Test: `test_jdbc_metadata.test_type_info_is_non_empty`.
+1. ODBC `SQLPrimaryKeys` / `SQLStatistics` error instead of returning empty.
+   - Calls: ODBC `SQLPrimaryKeys`, `SQLStatistics` (the JDBC `getPrimaryKeys`
+     equivalents are fixed; psqlodbc issues different SQL).
+   - Symptoms: `SQLStatistics` selects `i.indisprimary` without grouping it and
+     DataFusion rejects the reference as not in `GROUP BY` (PostgreSQL allows it
+     by functional dependency on the primary key); `SQLPrimaryKeys` hits a type
+     coercion the planner rejects.
+   - The correct answer for a backend with no keys or indexes is an empty result
+     set. Tests: the `*_are_empty_not_error` cases in `test_pyodbc_catalog`.
