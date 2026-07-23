@@ -133,10 +133,13 @@ class JdbcMetadataTest(FixtureServerCase):
             [0, 0, 0],
         )
 
-    @unittest.expectedFailure
     def test_type_info_is_non_empty(self):
-        """KNOWN GAP: getTypeInfo errors on a correlated scalar subquery
-        DataFusion rejects; should return the server's type catalogue."""
+        """getTypeInfo returns the server's type catalogue.
+
+        Its query filters with a correlated boolean scalar subquery (rewritten to
+        an EXISTS/count DataFusion can plan) and uses array_upper (mapped to
+        array_length); both are now handled.
+        """
         self.assertGreater(len(self.meta["typeInfo"]), 0)
 
 
