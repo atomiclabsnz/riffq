@@ -97,16 +97,12 @@ class PyodbcCatalogTest(FixtureServerCase):
                 finally:
                     conn.close()
 
-    @unittest.expectedFailure
     def test_primary_keys_are_empty_not_error(self):
-        """KNOWN GAP (deferred): SQLPrimaryKeys errors instead of returning empty.
+        """SQLPrimaryKeys returns empty (the fixture has no primary keys).
 
-        psqlodbc's SQLPrimaryKeys uses a different (information_schema
-        key-column-usage) query than JDBC getPrimaryKeys -- the JDBC path is
-        fixed, but the ODBC query fails on a separate pg_catalog gap (a type
-        coercion the planner rejects). The correct result for a backend with no
-        constraints is an empty set; a driver that errors here breaks table
-        introspection.
+        psqlodbc's query compares a boolean column to a character literal
+        (indisprimary = 't'); pg_catalog now coerces that to a boolean so the
+        query plans and returns an empty result instead of erroring.
         """
         conn = connect_odbc(self.PORT)
         try:
@@ -117,14 +113,12 @@ class PyodbcCatalogTest(FixtureServerCase):
         finally:
             conn.close()
 
-    @unittest.expectedFailure
     def test_statistics_are_empty_not_error(self):
-        """KNOWN GAP (deferred): SQLStatistics errors instead of returning empty.
+        """SQLStatistics returns empty (the fixture has no indexes).
 
-        psqlodbc's SQLStatistics query selects i.indisprimary without grouping
-        it; DataFusion rejects the reference as not in GROUP BY (Postgres allows
-        it via functional dependency). A separate pg_catalog gap from the JDBC
-        _pg_expandarray one.
+        Its query selects a bare literal (0) alongside plain columns; pg_catalog
+        no longer fabricates a GROUP BY for that (a literal is not an aggregate),
+        so the ORDER BY on an ungrouped column no longer errors.
         """
         conn = connect_odbc(self.PORT)
         try:
