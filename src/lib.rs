@@ -78,6 +78,12 @@ use pgwire::tokio::process_socket;
 
 mod helpers;
 pub mod pg;
+mod sql_batch;
+
+/// The variable name clients read the isolation level under, and the level
+/// riffq reports. Named here because two SHOW spellings answer with it.
+const TRANSACTION_ISOLATION_VARIABLE: &str = "transaction_isolation";
+const TRANSACTION_ISOLATION_LEVEL: &str = "read committed";
 use helpers::_debug_parameters;
 use pg::arrow_type_to_pgwire;
 use sqlparser::ast::Statement;
@@ -1430,19 +1436,8 @@ impl RiffqProcessor {
         Ok(())
     }
 
-    fn show_variable_response(&self, name: &str, format: FieldFormat) -> Option<Response> {
-        let ctx = self.get_ctx();
-        let state = ctx.state();
-        let opts = state.config_options().extensions.get::<ClientOpts>()?;
-
-        let value = match name {
-            "application_name" => opts.application_name.as_str(),
-            "datestyle" => opts.datestyle.as_str(),
-            "search_path" => opts.search_path.as_str(),
-            "server_version" => self.server_version.as_str(),
-            _ => return None,
-        };
-
+    /// Build a one-row, one-text-column response, the shape SHOW replies take.
+    fn single_text_response(name: &str, value: &str, format: FieldFormat) -> Option<Response> {
         let fields = Arc::new(vec![FieldInfo::new(
             name.to_string(),
             None,
@@ -1456,6 +1451,29 @@ impl RiffqProcessor {
         let row = encoder.take_row();
         let rows = stream::iter(vec![Ok(row)]);
         Some(Response::Query(QueryResponse::new(fields, rows)))
+    }
+
+    fn show_variable_response(&self, name: &str, format: FieldFormat) -> Option<Response> {
+        // transaction_isolation is answered without touching ClientOpts: the
+        // value is fixed, and psqlodbc asks for it while connecting, before
+        // anything has set client options.
+        if name == TRANSACTION_ISOLATION_VARIABLE {
+            return Self::single_text_response(name, TRANSACTION_ISOLATION_LEVEL, format);
+        }
+
+        let ctx = self.get_ctx();
+        let state = ctx.state();
+        let opts = state.config_options().extensions.get::<ClientOpts>()?;
+
+        let value = match name {
+            "application_name" => opts.application_name.as_str(),
+            "datestyle" => opts.datestyle.as_str(),
+            "search_path" => opts.search_path.as_str(),
+            "server_version" => self.server_version.as_str(),
+            _ => return None,
+        };
+
+        Self::single_text_response(name, value, format)
     }
 
     fn parse_show_variable(sql: &str) -> Option<String> {
@@ -1620,51 +1638,40 @@ impl StartupHandler for RiffqProcessor {
     }
 }
 
-#[async_trait]
-impl SimpleQueryHandler for RiffqProcessor {
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: std::fmt::Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
+impl RiffqProcessor {
+    /// Run one statement of a simple-query batch and build its response.
+    ///
+    /// Split out of `do_query` so every statement in a batch goes through the
+    /// same handling, including the SHOW special cases, rather than only the
+    /// first one.
+    async fn execute_simple_statement(
+        &self,
+        statement: &str,
+        connection_id: u64,
+    ) -> PgWireResult<Response> {
         // TODO: this should be up to the user to be handled here
-        let trimmed = query.trim();
-        let lowercase = trimmed.to_lowercase();
+        let lowercase = statement.trim().to_lowercase();
+        // "SHOW TRANSACTION ISOLATION LEVEL" is three keywords rather than one
+        // variable name, so it does not reach parse_show_variable below and is
+        // matched here instead. Both spellings answer with the same value.
         if lowercase == "show transaction isolation level" {
-            let field_infos = Arc::new(vec![FieldInfo::new(
-                "transaction_isolation".to_string(),
-                None,
-                None,
-                Type::TEXT,
+            if let Some(resp) = Self::single_text_response(
+                TRANSACTION_ISOLATION_VARIABLE,
+                TRANSACTION_ISOLATION_LEVEL,
                 FieldFormat::Text,
-            )]);
-
-            let mut encoder = DataRowEncoder::new(field_infos.clone());
-            encoder.encode_field(&Some("read committed"))?;
-            let row = encoder.take_row();
-
-            let rows = stream::iter(vec![Ok(row)]);
-            return Ok(vec![Response::Query(QueryResponse::new(field_infos, rows))]);
+            ) {
+                return Ok(resp);
+            }
         } else if let Some(var) = Self::parse_show_variable(lowercase.as_str()) {
             if let Some(resp) = self.show_variable_response(&var.to_lowercase(), FieldFormat::Text)
             {
-                return Ok(vec![resp]);
+                return Ok(resp);
             }
-        } else if lowercase == "" {
-            return Ok(vec![Response::Execution(Tag::new(""))]);
         }
-
-        debug!("[PGWIRE] do_query called with: {}", query);
-        let connection_id = client
-            .metadata()
-            .get("connection_id")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
 
         let result = self
             .query_runner
-            .execute(query.to_string(), None, None, false, connection_id)
+            .execute(statement.to_string(), None, None, false, connection_id)
             .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
@@ -1673,14 +1680,47 @@ impl SimpleQueryHandler for RiffqProcessor {
                 // Simple query protocol always uses text format
                 let formats: Vec<FieldFormat> = vec![FieldFormat::Text; schema.fields().len()];
                 let (schema, data_row_stream) = arrow_to_pg_rows(batches, schema, &formats);
-                Ok(vec![Response::Query(QueryResponse::new(
-                    schema,
-                    data_row_stream,
-                ))])
+                Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
             }
-            QueryResult::Tag(tag) => Ok(vec![Response::Execution(Tag::new(&tag))]),
+            QueryResult::Tag(tag) => Ok(Response::Execution(Tag::new(&tag))),
             QueryResult::Error(e) => Err(PgWireError::UserError(e)),
         }
+    }
+}
+
+#[async_trait]
+impl SimpleQueryHandler for RiffqProcessor {
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        debug!("[PGWIRE] do_query called with: {}", query);
+        let connection_id = client
+            .metadata()
+            .get("connection_id")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // One Query message may carry several statements separated by
+        // semicolons; PostgreSQL runs each and replies with one response per
+        // statement, which is the Vec this returns. Clients that build their
+        // own SQL rely on it -- Npgsql sends its whole startup type-loading
+        // batch this way -- so reading only the first statement makes the
+        // server unusable for them.
+        let statements = sql_batch::split_statements(query);
+        if statements.is_empty() {
+            return Ok(vec![Response::Execution(Tag::new(""))]);
+        }
+
+        let mut responses = Vec::with_capacity(statements.len());
+        for statement in statements {
+            // Returning on the first error abandons the rest of the batch,
+            // which is how PostgreSQL treats a failure mid-batch.
+            responses.push(self.execute_simple_statement(statement, connection_id).await?);
+        }
+        Ok(responses)
     }
 }
 
