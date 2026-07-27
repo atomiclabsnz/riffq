@@ -35,6 +35,25 @@ PSQLODBC_PREFIX="$TOOLCHAIN/psqlodbc"
 JDK_DIR="$TOOLCHAIN/jdk"
 JARS_DIR="$TOOLCHAIN/jars"
 ETC_DIR="$TOOLCHAIN/etc"
+DOTNET_DIR="$TOOLCHAIN/dotnet"
+
+# NuGet package cache for the .NET harness build. Kept inside the toolchain so
+# the build never writes to ~/.nuget and a wiped .toolchain really is a cold
+# start rather than one warmed by a cache outside it.
+NUGET_PACKAGES_DIR="$TOOLCHAIN/nuget"
+
+# The .NET harness project. Built once here so the tests never invoke a
+# compiler, matching how the Java harnesses are compiled ahead of their run.
+DOTNET_HARNESS_DIR="$HERE/dotnet"
+
+# CloudBeaver's unpacked image rootfs, and the server directory inside it.
+CLOUDBEAVER_ROOT="$TOOLCHAIN/cloudbeaver"
+CLOUDBEAVER_HOME="$CLOUDBEAVER_ROOT/opt/cloudbeaver"
+
+# The amd64 manifest of CloudBeaver 25.3.5, resolved once from that tag's image
+# index and pinned here. A digest names exact content, so this cannot drift the
+# way a tag can.
+CLOUDBEAVER_IMAGE_DIGEST="sha256:37acce3e649b28d782a9a99d8f18b0e448e318e29f078eacd511cb47018294e9"
 
 # Pinned upstream artifacts: each is "<filename>|<url>|<sha256>". Versions and
 # hashes were resolved once and frozen here so the toolchain cannot change under
@@ -43,6 +62,24 @@ UNIXODBC_ARTIFACT="unixODBC-2.3.12.tar.gz|https://www.unixodbc.org/unixODBC-2.3.
 PSQLODBC_ARTIFACT="psqlodbc-16.00.0000.tar.gz|https://ftp.postgresql.org/pub/odbc/versions.old/src/psqlodbc-16.00.0000.tar.gz|afd892f89d2ecee8d3f3b2314f1bd5bf2d02201872c6e3431e5c31096eca4c8b"
 PGJDBC_ARTIFACT="postgresql-42.7.13.jar|https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.jar|6e0e4cc2d8cae902084f8a2b18728b073a6fd9d1f87c9d8bff8f298c18185b93"
 JDK_ARTIFACT="OpenJDK21U-jdk_x64_linux_hotspot_21.0.11_10.tar.gz|https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_x64_linux_hotspot_21.0.11_10.tar.gz|4b2220e232a97997b436ca6ab15cbf70171ecff52958a46159dfa5a8c44ca4de"
+
+# Older pgjdbc releases the JDBC suite also runs against, so a catalog change
+# cannot silently break the driver versions deployed clients actually carry:
+# 42.7.8 is the release Tableau ships, and the 42.2 line is the long-lived
+# branch older BI installations pin. Each is ~1 MB, so all are fetched by
+# default rather than hidden behind a flag. Kept newest-first; PGJDBC_ARTIFACT
+# above stays the default the single-version run uses.
+# The .NET SDK the Npgsql harness is built with. The sha256 below was taken
+# from a download whose sha512 matched Microsoft's own published checksum in
+# the 9.0 release metadata, so the pin traces back to upstream rather than to
+# whatever happened to be downloaded here.
+DOTNET_ARTIFACT="dotnet-sdk-9.0.316-linux-x64.tar.gz|https://builds.dotnet.microsoft.com/dotnet/Sdk/9.0.316/dotnet-sdk-9.0.316-linux-x64.tar.gz|f3df20e692b4c9cf25b3a6a6f213e3c79c95d46e4fbc6ab53f772fbc9164a4d1"
+
+PGJDBC_MATRIX_ARTIFACTS="
+postgresql-42.7.8.jar|https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.8/postgresql-42.7.8.jar|2a32a9dcbc42d67a50ad3a0de5efd102c8d2be46720045f2cbd6689f160ab7c7
+postgresql-42.2.29.jar|https://repo1.maven.org/maven2/org/postgresql/postgresql/42.2.29/postgresql-42.2.29.jar|4c5d4528527354b2e594f458f0807e710f4d5683491179d2580f3d5ae5e7477c
+postgresql-42.2.14.jar|https://repo1.maven.org/maven2/org/postgresql/postgresql/42.2.14/postgresql-42.2.14.jar|48bbba05845b40bcce66ece3d7652153d27b5379d5ae90977b78eefd7c7a0287
+"
 
 WITH_JDBC_TOOL=0
 for arg in "$@"; do
@@ -142,8 +179,8 @@ extract_jdk() {
 }
 
 place_pgjdbc() {
-    # Copy the pinned pgjdbc jar into jars/. The Java harnesses are compiled and
-    # run with this jar on the classpath -- no Maven or Gradle involved.
+    # Copy the pinned pgjdbc jar into jars/ as postgresql.jar, the default the
+    # harnesses compile and run against -- no Maven or Gradle involved.
     if [ -f "$JARS_DIR/postgresql.jar" ]; then
         log "pgjdbc already placed"
         return 0
@@ -151,6 +188,85 @@ place_pgjdbc() {
     log "placing pgjdbc jar"
     mkdir -p "$JARS_DIR"
     cp "$DOWNLOADS/postgresql-42.7.13.jar" "$JARS_DIR/postgresql.jar"
+}
+
+place_pgjdbc_matrix() {
+    # Copy the older pgjdbc releases into jars/ under their versioned names.
+    # toolchain.py locates them by that name, so the matrix run selects a
+    # version without re-downloading anything.
+    log "placing pgjdbc matrix jars"
+    mkdir -p "$JARS_DIR"
+    echo "$PGJDBC_MATRIX_ARTIFACTS" | while read -r spec; do
+        [ -n "$spec" ] || continue
+        local name="${spec%%|*}"
+        cp "$DOWNLOADS/$name" "$JARS_DIR/$name"
+    done
+}
+
+extract_dotnet() {
+    # Unpack the .NET SDK. dotnet is invoked by absolute path from the tests,
+    # so nothing is added to PATH and no system install is touched.
+    if [ -x "$DOTNET_DIR/dotnet" ]; then
+        log "dotnet SDK already extracted"
+        return 0
+    fi
+    log "extracting dotnet SDK"
+    rm -rf "$DOTNET_DIR"
+    mkdir -p "$DOTNET_DIR"
+    tar xzf "$DOWNLOADS/dotnet-sdk-9.0.316-linux-x64.tar.gz" -C "$DOTNET_DIR"
+}
+
+build_dotnet_harness() {
+    # Restore and build the Npgsql harness so the tests only ever run it.
+    #
+    # --locked-mode makes the restore fail rather than resolve anything not
+    # already recorded in packages.lock.json, which is what makes a cold
+    # container reproduce the same dependency set instead of picking up
+    # whatever is newest. Regenerating the lock file after a deliberate version
+    # bump is a separate, explicit step: drop --locked-mode once, commit the
+    # updated packages.lock.json.
+    local published="$DOTNET_HARNESS_DIR/bin/Release/net9.0/RiffqNpgsqlHarness.dll"
+    if [ -f "$published" ] && [ "$published" -nt "$DOTNET_HARNESS_DIR/Program.cs" ]; then
+        log "dotnet harness already built"
+        return 0
+    fi
+    log "building dotnet harness"
+    (
+        cd "$DOTNET_HARNESS_DIR"
+        export DOTNET_CLI_TELEMETRY_OPTOUT=1
+        export DOTNET_NOLOGO=1
+        export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+        export NUGET_PACKAGES="$NUGET_PACKAGES_DIR"
+        "$DOTNET_DIR/dotnet" restore --locked-mode
+        "$DOTNET_DIR/dotnet" build --configuration Release --no-restore
+    )
+}
+
+install_cloudbeaver() {
+    # Unpack CloudBeaver from its container image.
+    #
+    # Upstream publishes no standalone server archive -- its GitHub releases
+    # carry source only -- so the built server exists solely as a container
+    # image, and this container has no runtime to run one with. oci_pull.py
+    # fetches the image's layers over plain HTTPS and unpacks them, which needs
+    # no daemon. The image is pinned by manifest digest and every layer is
+    # verified against the digest the manifest lists, the same guarantee the
+    # sha256-pinned tarballs above give.
+    if [ -x "$CLOUDBEAVER_HOME/run-cloudbeaver-server.sh" ]; then
+        log "CloudBeaver already installed"
+        return 0
+    fi
+    log "installing CloudBeaver from its image (about 470 MB)"
+    "$VENV_PY" - "$HERE" "$CLOUDBEAVER_IMAGE_DIGEST" "$DOWNLOADS/cloudbeaver-layers" \
+        "$CLOUDBEAVER_ROOT" <<'PYTHON'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from oci_pull import pull_rootfs
+
+layers = pull_rootfs("dbeaver/cloudbeaver", sys.argv[2], sys.argv[3], sys.argv[4])
+print(f"  applied {layers} layers")
+PYTHON
 }
 
 write_odbc_config() {
@@ -240,11 +356,22 @@ main() {
     fetch "$PSQLODBC_ARTIFACT"
     fetch "$PGJDBC_ARTIFACT"
     fetch "$JDK_ARTIFACT"
+    fetch "$DOTNET_ARTIFACT"
+    echo "$PGJDBC_MATRIX_ARTIFACTS" | while read -r spec; do
+        [ -n "$spec" ] || continue
+        fetch "$spec"
+    done
 
     # JDBC pieces first: they are simple copies/extracts and must not be
     # blocked by the more fragile ODBC driver-manager path.
     extract_jdk
     place_pgjdbc
+    place_pgjdbc_matrix
+
+    extract_dotnet
+    build_dotnet_harness
+
+    install_cloudbeaver
 
     build_unixodbc
     build_psqlodbc

@@ -2,29 +2,22 @@
 
 RiffqMetadataHarness opens one pgjdbc connection and prints the results of the
 DatabaseMetaData calls a JDBC application relies on. This module runs it once and
-asserts the working results against fixture_dataset, and records the gaps the
-driver surfaced as expectedFailure tests, each naming its cause. The gaps are
-also listed in tests/integration/README.md as follow-up work in riffq /
-pg_catalog. An expectedFailure that starts passing is reported as an unexpected
-success, so each turns back into a plain assertion once the gap is fixed.
+asserts every result against fixture_dataset. Each test's docstring names the
+pg_catalog feature its driver query depends on, so a regression in the catalog
+emulation fails a test that says why.
 
-Gaps found (all are pgjdbc-issued catalog queries riffq's emulation cannot yet
-answer):
-
-- getTables errors (an optimizer rule fails casting 'pg_class' to Int32 in the
-  driver's table query), so no table list comes back.
-- getPrimaryKeys / getImportedKeys / getIndexInfo error instead of returning
-  empty; riffq has no index/constraint introspection and pg_get_indexdef lacks
-  the multi-argument overload the driver calls.
-- getTypeInfo errors: its pg_catalog query uses a correlated scalar subquery
-  DataFusion rejects.
+Every gap this suite once guarded is fixed, so no expectedFailure tests remain;
+see the "Known gaps" section of tests/integration/README.md. Should a future
+driver version surface a new one, guard it with an expectedFailure naming its
+cause -- unittest reports an expectedFailure that starts passing as an
+unexpected success, the signal to promote it back to a plain assertion.
 """
 import unittest
 
 import fixture_dataset
 from jdbc import run_harness
 from server_case import FixtureServerCase
-from toolchain import require_jdbc
+from toolchain import require_jdbc, selected_pgjdbc_version
 
 
 @require_jdbc()
@@ -44,6 +37,20 @@ class JdbcMetadataTest(FixtureServerCase):
         self.assertEqual(self.meta["productName"], "PostgreSQL")
         self.assertEqual(self.meta["productVersion"], "17.0")
         self.assertTrue(self.meta["driverVersion"])
+
+    def test_running_driver_is_the_selected_version(self):
+        """The connected driver is the pgjdbc release this run selected.
+
+        Without this a matrix run would pass identically whether or not the jar
+        swap took effect, reporting coverage of four releases while exercising
+        one. pgjdbc reports its version as "42.2.14" or "42.2.14 (build ...)",
+        so match on the prefix.
+        """
+        self.assertTrue(
+            self.meta["driverVersion"].startswith(selected_pgjdbc_version()),
+            f"selected pgjdbc {selected_pgjdbc_version()} but the driver "
+            f"reports {self.meta['driverVersion']}",
+        )
 
     def test_catalogs_include_the_database(self):
         """getCatalogs lists the fixture database."""

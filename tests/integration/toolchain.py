@@ -32,8 +32,82 @@ ODBCINST_INI = os.path.join(ODBC_ETC, "odbcinst.ini")
 
 JAVA = os.path.join(TOOLCHAIN_DIR, "jdk", "bin", "java")
 JAVAC = os.path.join(TOOLCHAIN_DIR, "jdk", "bin", "javac")
-PGJDBC_JAR = os.path.join(TOOLCHAIN_DIR, "jars", "postgresql.jar")
+JARS_DIR = os.path.join(TOOLCHAIN_DIR, "jars")
 SQLWORKBENCH_JAR = os.path.join(TOOLCHAIN_DIR, "sqlworkbench", "sqlworkbench.jar")
+
+# The .NET SDK and the Npgsql harness setup_toolchain.sh builds with it. The
+# tests run the built assembly and never invoke the compiler themselves.
+DOTNET = os.path.join(TOOLCHAIN_DIR, "dotnet", "dotnet")
+DOTNET_HARNESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotnet")
+DOTNET_HARNESS_DLL = os.path.join(
+    DOTNET_HARNESS_DIR, "bin", "Release", "net9.0", "RiffqNpgsqlHarness.dll"
+)
+
+# CloudBeaver, unpacked from its container image by setup_toolchain.sh. The
+# image bundles the JRE the server runs on, so this tier does not use the
+# toolchain's JDK.
+CLOUDBEAVER_ROOT = os.path.join(TOOLCHAIN_DIR, "cloudbeaver")
+CLOUDBEAVER_HOME = os.path.join(CLOUDBEAVER_ROOT, "opt", "cloudbeaver")
+CLOUDBEAVER_LAUNCHER = os.path.join(CLOUDBEAVER_HOME, "run-cloudbeaver-server.sh")
+CLOUDBEAVER_JAVA_BIN = os.path.join(
+    CLOUDBEAVER_ROOT, "opt", "java", "openjdk", "bin", "java"
+)
+
+# The pgjdbc release the suite uses unless a matrix run selects another. It is
+# placed under a version-free name so the default path never depends on which
+# version is pinned.
+PGJDBC_DEFAULT_JAR = os.path.join(JARS_DIR, "postgresql.jar")
+PGJDBC_DEFAULT_VERSION = "42.7.13"
+
+# The environment variable a matrix run sets to pick one older release.
+PGJDBC_VERSION_ENV = "RIFFQ_PGJDBC_VERSION"
+
+# Older pgjdbc releases the matrix run exercises, newest first. These are the
+# versions deployed clients actually carry: 42.7.8 is the release Tableau
+# ships, and the 42.2 line is the long-lived branch older BI installations pin.
+# The driver picks its catalog SQL from the server version riffq reports, not
+# from its own version, so these mostly guard against that branching changing.
+PGJDBC_MATRIX_VERSIONS = (PGJDBC_DEFAULT_VERSION, "42.7.8", "42.2.29", "42.2.14")
+
+
+def pgjdbc_jar_for(version):
+    """Return the jar path for one pgjdbc version in the matrix.
+
+    Args:
+        version: A version string from PGJDBC_MATRIX_VERSIONS.
+
+    Returns:
+        The default jar's path for the default version, otherwise the
+        versioned jar setup_toolchain.sh placed alongside it.
+    """
+    if version == PGJDBC_DEFAULT_VERSION:
+        return PGJDBC_DEFAULT_JAR
+    return os.path.join(JARS_DIR, f"postgresql-{version}.jar")
+
+
+def selected_pgjdbc_version():
+    """Return the pgjdbc version this run drives, honouring the matrix variable.
+
+    Returns:
+        The value of RIFFQ_PGJDBC_VERSION when set, else PGJDBC_DEFAULT_VERSION.
+
+    Raises:
+        ValueError: If the variable names a version not in the matrix, which
+            would otherwise fail later as a confusing missing-jar error.
+    """
+    version = os.environ.get(PGJDBC_VERSION_ENV)
+    if not version:
+        return PGJDBC_DEFAULT_VERSION
+    if version not in PGJDBC_MATRIX_VERSIONS:
+        raise ValueError(
+            f"{PGJDBC_VERSION_ENV}={version} is not one of "
+            f"{', '.join(PGJDBC_MATRIX_VERSIONS)}"
+        )
+    return version
+
+
+# The jar the harnesses actually run against for this process.
+PGJDBC_JAR = pgjdbc_jar_for(selected_pgjdbc_version())
 
 # The odbcinst.ini names of the two driver flavours the setup script registers.
 ODBC_UNICODE_DRIVER = "PostgreSQL Unicode"
@@ -62,13 +136,23 @@ def has_odbc():
 
 
 def has_jdbc():
-    """Return True when the JDK and the pgjdbc jar are both present."""
+    """Return True when the JDK and the selected pgjdbc jar are both present."""
     return os.path.exists(JAVAC) and os.path.exists(JAVA) and os.path.exists(PGJDBC_JAR)
 
 
 def has_jdbc_tool():
     """Return True when the optional SQL Workbench/J jar is present."""
     return os.path.exists(SQLWORKBENCH_JAR)
+
+
+def has_dotnet():
+    """Return True when the .NET runtime and the built Npgsql harness exist."""
+    return os.path.exists(DOTNET) and os.path.exists(DOTNET_HARNESS_DLL)
+
+
+def has_cloudbeaver():
+    """Return True when CloudBeaver's launcher and its bundled JRE exist."""
+    return os.path.exists(CLOUDBEAVER_LAUNCHER) and os.path.exists(CLOUDBEAVER_JAVA_BIN)
 
 
 def require_odbc():
@@ -79,9 +163,29 @@ def require_odbc():
 
 
 def require_jdbc():
-    """Skip decorator for tests needing the JDBC toolchain, naming what is missing."""
+    """Skip decorator for tests needing the JDBC toolchain, naming what is missing.
+
+    The message names the selected pgjdbc version so a matrix run against a jar
+    the setup script has not placed reads as that, not as a missing toolchain.
+    """
     return unittest.skipUnless(
-        has_jdbc(), f"JDBC toolchain (JDK + pgjdbc) not installed; {_SETUP_HINT}"
+        has_jdbc(),
+        f"JDBC toolchain (JDK + pgjdbc {selected_pgjdbc_version()}) not "
+        f"installed; {_SETUP_HINT}",
+    )
+
+
+def require_dotnet():
+    """Skip decorator for tests needing the .NET tier, naming what is missing."""
+    return unittest.skipUnless(
+        has_dotnet(), f"dotnet SDK or Npgsql harness not built; {_SETUP_HINT}"
+    )
+
+
+def require_cloudbeaver():
+    """Skip decorator for the CloudBeaver tier, naming what is missing."""
+    return unittest.skipUnless(
+        has_cloudbeaver(), f"CloudBeaver not installed; {_SETUP_HINT}"
     )
 
 

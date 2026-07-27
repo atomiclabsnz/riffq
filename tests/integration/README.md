@@ -7,6 +7,15 @@ These tests prove that riffq's PostgreSQL wire protocol and its `pg_catalog` /
   (`psqlodbc`), both the Unicode and ANSI flavours.
 - JDBC: the official pgjdbc driver, driven from small Java harnesses, plus an
   optional second JDBC tool (SQL Workbench/J).
+- .NET: the Npgsql driver, driven from a small C# harness. Npgsql implements
+  the wire protocol from scratch rather than wrapping libpq, so it is the
+  strictest protocol client here and loads its type catalogue from `pg_type` on
+  connect.
+- DBeaver: CloudBeaver, DBeaver's metadata engine served over GraphQL instead
+  of a desktop GUI. DBeaver's PostgreSQL plugin issues its own SQL against
+  `pg_class`, `pg_namespace`, and `pg_attribute` rather than going through
+  pgjdbc's `DatabaseMetaData`, so it covers a catalog surface no other tier
+  reaches.
 
 These drivers issue their own catalog SQL on connect and on every metadata call
 (`SQLTables`, `SQLColumns`, `DatabaseMetaData.getTables`, `getColumns`,
@@ -31,14 +40,60 @@ Add the optional SQL Workbench/J client with:
 make integration-toolchain ARGS=--with-jdbc-tool
 ```
 
+### The pgjdbc version matrix
+
+`make integration-test` runs the JDBC layer against one pinned pgjdbc release
+(42.7.13). Clients in the field carry whatever version their vendor shipped --
+Tableau ships 42.7.8, and older BI installations pin the long-lived 42.2 line --
+so `make integration-matrix` runs that layer once per release:
+
+```
+make integration-matrix          # 42.7.13, 42.7.8, 42.2.29, 42.2.14
+```
+
+It runs every version before reporting, so one failure does not hide the rest,
+and `make all-tests` includes it. To drive a single version by hand, set the
+same variable the target uses:
+
+```
+RIFFQ_PGJDBC_VERSION=42.2.14 python -m unittest discover -s . -t . -k jdbc
+```
+
+The versions live in two places that must agree: `PGJDBC_MATRIX_VERSIONS` in
+`toolchain.py` (which resolves each to its jar) and the same-named variable in
+the Makefile (which drives the loop). `setup_toolchain.sh` downloads all of
+them by default -- each is about 1 MB, so there is no flag to skip them.
+
+Adding a version means adding its pinned `<name>|<url>|<sha256>` line to
+`PGJDBC_MATRIX_ARTIFACTS` in `setup_toolchain.sh` and the version to both lists
+above. `test_pgjdbc_matrix.py` then fails until the jar is actually present, so
+a half-added version cannot silently skip.
+
+Which driver a run really loaded is asserted, not assumed:
+`test_running_driver_is_the_selected_version` compares the version pgjdbc
+reports over the wire against the selected one, so a jar swap that quietly did
+nothing fails instead of passing four identical runs.
+
 `make test` does not run these tests: they live in a non-package subdirectory
 that `unittest discover -s tests` does not recurse into, so a bare machine stays
 green. `make all-tests` runs `integration-test` last; tests whose toolchain
 piece is missing skip themselves with a message naming what to install.
 
-The toolchain build (unixODBC and psqlodbc from source, plus a JDK and jar
-downloads) takes a few minutes the first time and is idempotent afterwards. Every
-download is pinned to a SHA-256, so a changed upstream artifact fails loudly.
+The toolchain build takes a while the first time and is idempotent afterwards:
+unixODBC and psqlodbc are built from source, and a JDK, the pgjdbc jars, the
+.NET SDK (about 200 MB) and CloudBeaver (about 470 MB) are downloaded. Nothing
+is fetched at test time, so a run needs the network only for this step.
+
+Every artifact is pinned and verified. The tarballs and jars are pinned by
+SHA-256; the .NET SDK's pin was taken from a download whose SHA-512 matched
+Microsoft's published checksum; Npgsql is pinned by an exact version plus a
+NuGet lock file restored in locked mode; and CloudBeaver is pinned by container
+image manifest digest, with every layer checked against the digest the manifest
+lists. A changed upstream artifact fails loudly rather than being used.
+
+CloudBeaver needs no container runtime. Upstream ships no standalone server
+archive, so `oci_pull.py` fetches the image's layers over plain HTTPS and
+unpacks them; the image bundles the JRE the server runs on.
 
 ### Running one layer in isolation
 
@@ -63,6 +118,15 @@ importable), or via `make integration-test` which sets the paths up.
   DuckDB via teleduck's `DuckdbCatalogSource`, with a JSON-lines query log.
 - `server_case.py` -- shared TestCase base that runs one fixture server per class.
 - `jdbc.py` -- compiles and runs the Java harnesses.
+- `test_pgjdbc_matrix.py` -- covers the pgjdbc version selection itself.
+- `dotnet/` -- the Npgsql harness project (C#), with its NuGet lock file.
+- `dotnet_harness.py` -- runs the built Npgsql harness.
+- `test_npgsql.py` -- the .NET tier.
+- `oci_pull.py` -- fetches and unpacks a container image without a runtime.
+- `cloudbeaver/` -- the CloudBeaver configs seeded into a fresh workspace.
+- `cloudbeaver_server.py`, `cloudbeaver_client.py` -- start CloudBeaver and
+  drive its GraphQL API.
+- `test_cloudbeaver.py` -- the DBeaver-metadata tier.
 - `test_fixture_smoke.py` -- validates the fixture with plain psycopg.
 - `test_pyodbc_catalog.py`, `test_pyodbc_queries.py` -- ODBC tests.
 - `test_jdbc_metadata.py`, `test_jdbc_extended.py` -- JDBC tests.
@@ -81,12 +145,44 @@ reach this log; it captures the data path only.
 
 ## Known gaps
 
-None. Every gap this suite found has been fixed, so the whole suite passes with
-no `expectedFailure` tests remaining. The gaps found and closed were: the ANSI
-driver's text decoding (a client-side pyodbc `setdecoding` fix), `getTables`,
+Every gap the ODBC and JDBC tiers found has been fixed: the ANSI driver's text
+decoding (a client-side pyodbc `setdecoding` fix), `getTables`,
 `getImportedKeys` / `getIndexInfo`, `getPrimaryKeys`, `getTypeInfo`,
 `SQLPrimaryKeys` / `SQLStatistics`, and boolean/timestamp / ODBC parameter
 binding.
+
+The .NET and DBeaver tiers each surfaced gaps that are still open, guarded by
+`expectedFailure` tests naming their cause:
+
+- A `table_type` predicate plus a bound parameter matches nothing
+  (`test_npgsql.py`). See below; this is the only gap the .NET tier still has.
+
+The .NET tier found two further gaps that are now fixed, both of which stopped
+Npgsql connecting at all rather than merely degrading metadata:
+
+- Multi-statement simple-query batches. Npgsql's startup sends
+  `SELECT version();` and its `pg_type` queries as one message and riffq ran
+  only the first statement. Fixed in riffq; covered by
+  `tests/test_multi_statement_query.py`.
+- A correlated scalar subquery inside a derived table, which the planner
+  refused with "Correlated scalar subquery must be aggregated to return at most
+  one row". Fixed in pg_catalog; covered by
+  `pg_catalog/tests/correlated_scalar_subquery_in_derived_table.rs`.
+
+The tier now connects with Npgsql's default settings, so its startup type
+loading runs against the catalog on every run.
+- A `table_type` predicate plus a bound parameter matches nothing
+  (`test_npgsql.py`). Npgsql's `GetSchema("Tables")` both filters on
+  `information_schema.tables.table_type` and binds the schema as a parameter,
+  and returns empty. Isolated in
+  `claude-scripts/isolate_npgsql_get_tables_query.py`: either half alone works,
+  and selecting `table_type` on the parameterized path returns the right value,
+  so only the comparison fails.
+The DBeaver tier's two gaps turned out to be a single bug and are fixed:
+`pg_namespace` carried two rows for `public` (a built-in one at PostgreSQL's
+canonical oid 2200 plus a generated one), and DBeaver bound the empty one when
+listing a schema's relations. Covered by the namespace-shadowing tests in
+`pg_catalog/tests/lazy_pg_catalog.rs`.
 
 If a future driver or version surfaces a new gap, record it here and guard it
 with an `expectedFailure` test (naming its cause) until it is fixed -- an

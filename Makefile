@@ -1,4 +1,8 @@
-.PHONY: docs test all-tests integration-toolchain integration-test dev-build docs-serve
+.PHONY: docs test all-tests integration-toolchain integration-test integration-matrix dev-build docs-serve
+
+# pgjdbc releases integration-matrix drives the JDBC suite against, mirroring
+# PGJDBC_MATRIX_VERSIONS in tests/integration/toolchain.py.
+PGJDBC_MATRIX_VERSIONS := 42.7.13 42.7.8 42.2.29 42.2.14
 
 # Absolute path to the driver-integration toolchain, needed on LD_LIBRARY_PATH
 # so the pyodbc wheel resolves our unixODBC before Python starts.
@@ -24,12 +28,32 @@ integration-test:
 	ODBCINI=$(INTEGRATION_TOOLCHAIN)/etc/odbc.ini \
 	python -m unittest discover -s $(INTEGRATION_DIR) -t $(INTEGRATION_DIR)
 
+# Run the JDBC layer once per pinned pgjdbc release. Clients carry whichever
+# version their vendor shipped (Tableau ships 42.7.8; older BI installs pin the
+# 42.2 line), so a catalog change that only works on the newest driver has to
+# fail here. Runs every version before reporting, so one break does not hide
+# the rest.
+integration-matrix:
+	@failed=""; \
+	for version in $(PGJDBC_MATRIX_VERSIONS); do \
+		echo "== pgjdbc $$version =="; \
+		RIFFQ_PGJDBC_VERSION=$$version \
+		LD_LIBRARY_PATH=$(INTEGRATION_TOOLCHAIN)/unixodbc/lib \
+		ODBCSYSINI=$(INTEGRATION_TOOLCHAIN)/etc \
+		ODBCINI=$(INTEGRATION_TOOLCHAIN)/etc/odbc.ini \
+		python -m unittest discover -s $(INTEGRATION_DIR) -t $(INTEGRATION_DIR) -k jdbc \
+			|| failed="$$failed $$version"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED under pgjdbc:$$failed"; exit 1; fi; \
+	echo "all pgjdbc versions passed: $(PGJDBC_MATRIX_VERSIONS)"
+
 all-tests:
 	maturin develop
 	python3 -m unittest discover -s tests
 	python3 -m unittest discover -s test_concurrency
 	cd teleduck && pip install -e . && python3 -m unittest discover -s tests
 	$(MAKE) integration-test
+	$(MAKE) integration-matrix
 
 dev-build:
 	maturin build --profile=fast -i python3

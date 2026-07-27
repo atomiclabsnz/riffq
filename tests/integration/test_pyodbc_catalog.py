@@ -10,10 +10,8 @@ The connections are opened with ``connect_odbc``, which configures pyodbc for
 narrow-char decoding so the ANSI driver (which cannot produce wide characters)
 reads text results correctly.
 
-primaryKeys and statistics remain ``expectedFailure``: riffq has no
-pg_index / pg_am-backed introspection, so those driver queries error instead of
-returning empty. That is tracked as pg_catalog follow-up work in
-tests/integration/README.md.
+Every metadata call this suite exercises now succeeds, so no expectedFailure
+tests remain; see the "Known gaps" section of tests/integration/README.md.
 """
 import unittest
 
