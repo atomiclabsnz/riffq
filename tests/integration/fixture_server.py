@@ -223,9 +223,12 @@ def start_process(port, log_path, host="127.0.0.1"):
         target=run_server, args=(port, log_path, host), daemon=True
     )
     process.start()
+    # Probe the database the fixture actually serves. The DuckDB source reports
+    # exactly one, and a catalog-emulating server refuses any other name, so
+    # probing under some other dbname never gets a connection at all.
     wait_for_catalog(
         port,
-        "db",
+        fixture_dataset.DATABASE_NAME,
         "SELECT datname FROM pg_catalog.pg_database "
         f"WHERE datname='{fixture_dataset.DATABASE_NAME}'",
         fixture_dataset.DATABASE_NAME,

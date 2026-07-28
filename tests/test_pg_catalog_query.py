@@ -48,6 +48,10 @@ def _run_server_catalog(port: int, enabled: bool):
         send_batch(batch, callback)
 
     server = riffq.Server(f"127.0.0.1:{port}")
+    # Catalog emulation serves one context per registered database and refuses
+    # any other, so the database these tests connect to has to be declared.
+    if enabled:
+        server.register_database("db")
     server.on_query(handle_query)
     server.start(catalog_emulation=enabled)
 

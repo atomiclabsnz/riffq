@@ -54,7 +54,7 @@ class DuckDbCatalogTest(unittest.TestCase):
         # pg_database) until it answers instead of sleeping a fixed amount.
         waited = wait_for_catalog(
             cls.port,
-            "db",
+            cls.database_name,
             f"SELECT datname FROM pg_catalog.pg_database WHERE datname='{cls.database_name}'",
             cls.database_name,
         )
@@ -66,7 +66,7 @@ class DuckDbCatalogTest(unittest.TestCase):
         Path(cls.db_file).unlink(missing_ok=True)
 
     def test_catalog_entries(self):
-        conn = psycopg.connect(f"postgresql://user:123@127.0.0.1:{self.port}/db")
+        conn = psycopg.connect(f"postgresql://user:123@127.0.0.1:{self.port}/{self.database_name}")
         with conn.cursor() as cur:
             cur.execute(f"SELECT datname FROM pg_catalog.pg_database WHERE datname ='{self.database_name}' ")
             self.assertEqual(cur.fetchone()[0], self.database_name)

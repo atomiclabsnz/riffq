@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion_pg_catalog::session::ClientOpts;
+use datafusion_pg_catalog::session::{set_session_user, ClientOpts};
 use futures::{Sink, SinkExt, Stream};
 use log::{debug, error, info};
 use pyo3::prelude::*;
@@ -17,6 +17,7 @@ use tokio::net::TcpSocket;
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::oneshot;
+use tokio::sync::OnceCell;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
@@ -1203,7 +1204,6 @@ trait QueryRunner: Send + Sync {
         connection_id: u64,
     ) -> datafusion::error::Result<QueryResult>;
 
-    fn set_ctx(&self, _ctx: Arc<SessionContext>) {}
 }
 
 pub enum QueryResult {
@@ -1225,7 +1225,8 @@ impl std::error::Error for UserQueryError {}
 
 struct RouterQueryRunner {
     py_worker: Arc<PythonWorker>,
-    catalog_ctx: Arc<Mutex<Arc<SessionContext>>>,
+    /// The connection's catalog context, empty until its database is known.
+    catalog_ctx: Arc<Mutex<Option<Arc<SessionContext>>>>,
 }
 
 #[async_trait]
@@ -1238,7 +1239,14 @@ impl QueryRunner for RouterQueryRunner {
         do_describe: bool,
         connection_id: u64,
     ) -> datafusion::error::Result<QueryResult> {
-        let ctx = self.catalog_ctx.lock().unwrap().clone();
+        // pgwire delivers the startup message, which names the database, before
+        // any query, so this is a protocol violation rather than a state a
+        // well-behaved client can reach.
+        let ctx = self.catalog_ctx.lock().unwrap().clone().ok_or_else(|| {
+            DataFusionError::Execution(
+                "a query arrived before the connection selected a database".to_string(),
+            )
+        })?;
         let py_worker = self.py_worker.clone();
 
         let tag_holder = Arc::new(Mutex::new(None));
@@ -1284,9 +1292,6 @@ impl QueryRunner for RouterQueryRunner {
         }
     }
 
-    fn set_ctx(&self, ctx: Arc<SessionContext>) {
-        *self.catalog_ctx.lock().unwrap() = ctx;
-    }
 }
 
 struct DirectQueryRunner {
@@ -1310,129 +1315,271 @@ impl QueryRunner for DirectQueryRunner {
         )
     }
 
-    fn set_ctx(&self, _ctx: Arc<SessionContext>) {}
+}
+
+/// How a server was told which databases it has and what each one contains.
+///
+/// The two ways are mutually exclusive: installing a lazy source makes it
+/// authoritative for user objects and the eager `register_*` calls are ignored.
+enum CatalogRegistrations {
+    /// A Python object reporting databases, schemas, relations and columns. It
+    /// is consulted afresh on every catalog scan, so a database created after
+    /// the server started is connectable without a restart.
+    LazySource(Py<PyAny>),
+    /// What `register_database` / `register_schema` / `register_table` recorded
+    /// before `start()` was called. Fixed for the life of the server.
+    Declared {
+        databases: Vec<String>,
+        schemas: Vec<(String, String)>,
+        tables: Vec<(String, String, String, Vec<BTreeMap<String, ColumnDef>>)>,
+    },
+}
+
+impl CatalogRegistrations {
+    /// The databases a client may connect to.
+    ///
+    /// Asked afresh every time rather than cached, because a lazy source can
+    /// gain a database while the server runs and refusing to connect to it
+    /// until a restart is the thing lazy building exists to avoid.
+    fn connectable_databases(&self) -> DFResult<Vec<String>> {
+        match self {
+            CatalogRegistrations::LazySource(obj) => {
+                let source = PyLazyCatalogSource {
+                    obj: Python::attach(|py| obj.clone_ref(py)),
+                };
+                let mut names = Vec::new();
+                source.databases(&mut |defs| {
+                    names.extend(defs.into_iter().map(|def| def.datname));
+                })?;
+                Ok(names)
+            }
+            CatalogRegistrations::Declared { databases, .. } => Ok(databases.clone()),
+        }
+    }
+
+    /// Build one database's catalog context, in full, from scratch.
+    ///
+    /// Nothing is shared with another database's context and nothing is cloned
+    /// from a common base: each carries its own built-in catalog, its own
+    /// functions and its own views, planned against its own objects. That is
+    /// what stops one connection from seeing another database's tables, and it
+    /// is why `default_catalog` is the database name - `current_database()`
+    /// reports the session's default catalog, so a context whose two names
+    /// disagree serves one database's rows while naming another.
+    async fn build_context(&self, database: &str) -> DFResult<SessionContext> {
+        match self {
+            CatalogRegistrations::LazySource(obj) => {
+                let source: Arc<dyn LazyCatalogSource> = Arc::new(PyLazyCatalogSource {
+                    obj: Python::attach(|py| obj.clone_ref(py)),
+                });
+                let (ctx, _log) = get_base_session_context_with_lazy_catalog(
+                    None,
+                    database.to_string(),
+                    "public".to_string(),
+                    source,
+                    LazyCatalogOptions::all(),
+                    database.to_string(),
+                )
+                .await?;
+                Ok(ctx)
+            }
+            CatalogRegistrations::Declared {
+                databases,
+                schemas,
+                tables,
+            } => {
+                // "public", matching the lazy path and PostgreSQL's own default.
+                // The default schema is what the router substitutes for "$user"
+                // when probing whether a name is a user table, and what an
+                // unresolvable name is reported under, so the two paths naming it
+                // differently made those answers depend on how the host had
+                // registered its catalog.
+                let (ctx, _log) =
+                    get_base_session_context(None, database.to_string(), "public".to_string())
+                        .await?;
+
+                // pg_database lists every database on the server, seen from any
+                // of them, which is how PostgreSQL answers "\l".
+                for db in databases {
+                    register_user_database(&ctx, db).await?;
+                }
+
+                // Schemas and relations, by contrast, belong to one database and
+                // only that database's context registers them.
+                for (db, schema) in schemas.iter().filter(|(db, _)| db == database) {
+                    register_schema(&ctx, db, schema).await?;
+                }
+                for (db, schema, table, cols) in tables.iter().filter(|(db, ..)| db == database) {
+                    // register_user_tables identifies the schema by OID; register_schema
+                    // is idempotent and returns the OID of the existing-or-created schema.
+                    let schema_oid = register_schema(&ctx, db, schema).await?;
+                    register_user_tables(&ctx, db, schema_oid, table, cols.clone()).await?;
+                }
+                Ok(ctx)
+            }
+        }
+    }
+}
+
+/// The catalog contexts a catalog-emulating server serves, one per database,
+/// each built the first time a client connects to that database.
+///
+/// Building costs on the order of a second, so it is deferred until someone
+/// actually asks for that database and then kept for the life of the server. A
+/// context is never evicted: a database the host stops reporting keeps its
+/// context until restart.
+struct CatalogContexts {
+    registrations: CatalogRegistrations,
+    /// One cell per database. The `Mutex` guards which databases have a cell;
+    /// the cell itself guards the build.
+    contexts: Mutex<HashMap<String, Arc<OnceCell<Arc<SessionContext>>>>>,
+}
+
+impl CatalogContexts {
+    /// Wrap `registrations` with an empty context cache.
+    fn new(registrations: CatalogRegistrations) -> Self {
+        Self {
+            registrations,
+            contexts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The base context for `database`, building it if this is the first
+    /// connection to it.
+    ///
+    /// Concurrent first connections to one database build it once. The `Mutex`
+    /// is held only long enough to hand out that database's cell - never across
+    /// the build - and `get_or_try_init` makes the losers wait for the winner
+    /// instead of each building their own copy. A build that fails leaves the
+    /// cell empty, so the next connection retries rather than inheriting a
+    /// failure that may have been transient in the host's callback.
+    async fn base_context(&self, database: &str) -> DFResult<Arc<SessionContext>> {
+        let cell = {
+            let mut contexts = self.contexts.lock().unwrap();
+            contexts.entry(database.to_string()).or_default().clone()
+        };
+
+        cell.get_or_try_init(|| async {
+            let started = std::time::Instant::now();
+            let ctx = self.registrations.build_context(database).await?;
+            info!(
+                "built catalog context for database {} in {:?}",
+                database,
+                started.elapsed()
+            );
+            Ok(Arc::new(ctx))
+        })
+        .await
+        .map(Arc::clone)
+    }
+}
+
+/// The error a client gets for a database this server does not have.
+///
+/// PostgreSQL sends no hint here, but riffq does: naming the databases that do
+/// exist turns the most likely mistake - connecting under a name the host never
+/// registered - into a self-answering error.
+fn database_does_not_exist(database: &str, connectable: &[String]) -> PgWireError {
+    let mut error = ErrorInfo::new(
+        "FATAL".to_string(),
+        "3D000".to_string(),
+        format!("database \"{database}\" does not exist"),
+    );
+    error.hint = Some(if connectable.is_empty() {
+        "this server registered no databases; call register_database(name) or \
+         set_lazy_catalog(source) before start(catalog_emulation=True)"
+            .to_string()
+    } else {
+        format!("available databases: {}", connectable.join(", "))
+    });
+    PgWireError::UserError(Box::new(error))
 }
 
 pub struct RiffqProcessor {
     py_worker: Arc<PythonWorker>,
     conn_id_sender: Arc<Mutex<Option<oneshot::Sender<u64>>>>,
     query_runner: Arc<dyn QueryRunner>,
-    ctx_map: Arc<HashMap<String, Arc<SessionContext>>>,
-    ctx: Arc<Mutex<Arc<SessionContext>>>,
+    /// The per-database contexts, or `None` when the server was started without
+    /// `catalog_emulation`: then the host answers catalog queries itself and
+    /// riffq has no catalog to isolate.
+    catalog: Option<Arc<CatalogContexts>>,
+    /// This connection's own context, installed once its database is known.
+    ///
+    /// `None` until then. A query cannot legitimately arrive first - pgwire
+    /// delivers the startup message before anything else - so a query that finds
+    /// it empty is a protocol violation and says so, rather than being served by
+    /// whatever context happened to be lying around.
+    ctx: Arc<Mutex<Option<Arc<SessionContext>>>>,
     server_version: String,
 }
 
-use datafusion::{
-    common::ScalarValue,
-    logical_expr::{ColumnarValue, Volatility, create_udf},
-};
-
 impl RiffqProcessor {
-    fn get_ctx(&self) -> Arc<SessionContext> {
+    fn get_ctx(&self) -> Option<Arc<SessionContext>> {
         self.ctx.lock().unwrap().clone()
     }
 
-    fn update_ctx_from_client<C>(&self, client: &C)
-    where
-        C: ClientInfo + ?Sized,
-    {
-        if let Some(db) = client
-            .metadata()
-            .get(pgwire::api::METADATA_DATABASE)
-            .cloned()
-        {
-            if let Some(base) = self.ctx_map.get(&db) {
-                let new_ctx = Arc::new(SessionContext::new_with_state(base.state().clone()));
-                *self.ctx.lock().unwrap() = new_ctx.clone();
-                self.query_runner.set_ctx(new_ctx);
-                log::debug!("updated context for db {}", db);
-            }
-        }
-    }
+    /// Admit this connection to `database`, give it a context, and record the
+    /// role it authenticated as.
+    ///
+    /// Refuses a database the host never registered, as PostgreSQL does. Does
+    /// nothing on a server started without `catalog_emulation`, which has no
+    /// catalog and therefore no databases to admit anyone to.
+    ///
+    /// Takes the names rather than the client because `on_startup`'s bounds do
+    /// not include `C: Sync`, so a borrow of the client cannot be held across an
+    /// await point and they have to be copied out before this is called.
+    async fn install_context_for_database(
+        &self,
+        database: Option<String>,
+        user: Option<String>,
+    ) -> PgWireResult<()> {
+        let Some(catalog) = self.catalog.as_ref() else {
+            return Ok(());
+        };
+        let Some(database) = database else {
+            return Ok(());
+        };
 
-    fn register_current_database<C>(&self, client: &C) -> datafusion::error::Result<()>
-    where
-        C: ClientInfo + ?Sized,
-    {
-        static KEY: &str = "current_database";
-
-        let ctx = self.get_ctx();
-        if ctx.state().scalar_functions().contains_key(KEY) {
+        // Already admitted. on_startup runs twice when authentication is
+        // enabled - once for the Startup message and again for the password -
+        // and the second pass must not rebuild or re-admit.
+        if self.get_ctx().is_some() {
             return Ok(());
         }
 
-        if let Some(db) = client
-            .metadata()
-            .get(pgwire::api::METADATA_DATABASE)
-            .cloned()
-        {
-            let fun = Arc::new(move |_args: &[ColumnarValue]| {
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(db.clone()))))
-            });
-            let udf = create_udf(KEY, vec![], DataType::Utf8, Volatility::Stable, fun.clone());
-            ctx.register_udf(udf);
-            // udf.with_aliases("pg_catalog.current_database");
-            let udf = create_udf(
-                "pg_catalog.current_database",
-                vec![],
-                DataType::Utf8,
-                Volatility::Stable,
-                fun.clone(),
-            );
-            ctx.register_udf(udf);
+        let connectable = catalog
+            .registrations
+            .connectable_databases()
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        if !connectable.iter().any(|name| *name == database) {
+            return Err(database_does_not_exist(&database, &connectable));
         }
 
-        Ok(())
-    }
+        let base = catalog
+            .base_context(&database)
+            .await
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
-    fn register_session_user<C>(&self, client: &C) -> datafusion::error::Result<()>
-    where
-        C: ClientInfo + ?Sized,
-    {
-        static KEY: &str = "session_user";
-        let ctx = self.get_ctx();
-        if ctx.state().scalar_functions().contains_key(KEY) {
-            return Ok(());
+        // A per-connection context over the shared base. The cached context is
+        // never handed out directly: per-connection state lives in the session
+        // config (ClientOpts) and in the identity UDFs registered below, so
+        // sharing one context would leak the first connection's user and
+        // settings to every later connection to the same database.
+        //
+        // The query runner reads the same cell, so writing it here is all that
+        // is needed to point this connection's queries at the new context.
+        let conn_ctx = Arc::new(SessionContext::new_with_state(base.state().clone()));
+
+        // Authentication is riffq's job, so riffq is what tells the catalog who
+        // connected. current_user / session_user / current_role read this back
+        // out of the session config when they are called, including from inside
+        // a view body planned long before this connection existed.
+        if let Some(user) = user {
+            set_session_user(&conn_ctx, &user).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         }
 
-        if let Some(user) = client.metadata().get(pgwire::api::METADATA_USER).cloned() {
-            let fun = Arc::new(move |_args: &[ColumnarValue]| {
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(user.clone()))))
-            });
-            let udf = create_udf(KEY, vec![], DataType::Utf8, Volatility::Stable, fun);
-            ctx.register_udf(udf);
-        }
-
-        Ok(())
-    }
-
-    fn register_current_user<C>(&self, client: &C) -> datafusion::error::Result<()>
-    where
-        C: ClientInfo + ?Sized,
-    {
-        static KEY: &str = "current_user";
-
-        let ctx = self.get_ctx();
-        if ctx.state().scalar_functions().contains_key(KEY) {
-            return Ok(());
-        }
-
-        if let Some(user) = client.metadata().get(pgwire::api::METADATA_USER).cloned() {
-            let fun = Arc::new(move |_args: &[ColumnarValue]| {
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(user.clone()))))
-            });
-            let udf = create_udf(KEY, vec![], DataType::Utf8, Volatility::Stable, fun.clone());
-            ctx.register_udf(udf);
-            let udf = create_udf(
-                "pg_catalog.current_user",
-                vec![],
-                DataType::Utf8,
-                Volatility::Stable,
-                fun,
-            );
-            ctx.register_udf(udf);
-        }
-
+        *self.ctx.lock().unwrap() = Some(conn_ctx);
+        log::debug!("installed context for database {}", database);
         Ok(())
     }
 
@@ -1461,7 +1608,10 @@ impl RiffqProcessor {
             return Self::single_text_response(name, TRANSACTION_ISOLATION_LEVEL, format);
         }
 
-        let ctx = self.get_ctx();
+        // No context means no ClientOpts to read: either the server does not
+        // emulate the catalog, or this variable was asked for before the startup
+        // message named a database. Answering None lets the host handle it.
+        let ctx = self.get_ctx()?;
         let state = ctx.state();
         let opts = state.config_options().extensions.get::<ClientOpts>()?;
 
@@ -1507,6 +1657,11 @@ impl StartupHandler for RiffqProcessor {
         let mut params = DefaultServerParameterProvider::default();
         params.server_version = self.server_version.clone();
 
+        // With authentication enabled the Startup message only asks the client
+        // for a password, and this handler is called again with it. Noted here
+        // because `message` is consumed by the match below.
+        let is_startup_message = matches!(message, PgWireFrontendMessage::Startup(_));
+
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
@@ -1551,6 +1706,17 @@ impl StartupHandler for RiffqProcessor {
                         client.close().await?;
                         return Ok(());
                     }
+                    // Admit the connection to its database BEFORE the handshake completes.
+                    // finish_authentication sends ReadyForQuery, after which the client
+                    // considers itself connected and a refusal arrives too late to stop it.
+                    self.install_context_for_database(
+                        client
+                            .metadata()
+                            .get(pgwire::api::METADATA_DATABASE)
+                            .cloned(),
+                        client.metadata().get(pgwire::api::METADATA_USER).cloned(),
+                    )
+                    .await?;
                     finish_authentication(client, &params).await?;
                 }
             }
@@ -1617,9 +1783,29 @@ impl StartupHandler for RiffqProcessor {
                     return Ok(());
                 }
 
+                // Admit the connection to its database BEFORE the handshake completes.
+                // finish_authentication sends ReadyForQuery, after which the client
+                // considers itself connected and a refusal arrives too late to stop it.
+                self.install_context_for_database(
+                    client
+                        .metadata()
+                        .get(pgwire::api::METADATA_DATABASE)
+                        .cloned(),
+                    client.metadata().get(pgwire::api::METADATA_USER).cloned(),
+                )
+                .await?;
+
                 finish_authentication(client, &params).await?;
             }
             _ => {}
+        }
+
+        // Nothing below has a context to work with until the connection has been
+        // admitted, and with authentication enabled that has not happened yet:
+        // the Startup message only asked the client for a password, and this
+        // handler runs again once it arrives.
+        if is_startup_message && self.py_worker.authentication_enabled() {
+            return Ok(());
         }
 
         let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
@@ -1628,11 +1814,6 @@ impl StartupHandler for RiffqProcessor {
             .get(pgwire::api::METADATA_DATABASE)
             .cloned();
         log::debug!("database: {:?} {:?}", database, user);
-        self.update_ctx_from_client(client);
-
-        let _ = self.register_current_database(client);
-        let _ = self.register_session_user(client);
-        let _ = self.register_current_user(client);
 
         Ok(())
     }
@@ -2526,6 +2707,22 @@ impl Server {
         catalog_emulation: bool,
         server_version: Option<String>,
     ) -> PyResult<()> {
+        // A catalog-emulating server serves one context per registered database
+        // and refuses any other, so with nothing registered it would bind a port
+        // and then refuse every client. Say so now instead: unlike a lazy
+        // source, which can gain a database while the server runs, the eager
+        // registrations are fixed at this point and this can never come right.
+        if catalog_emulation
+            && self.databases.is_empty()
+            && self.lazy_catalog_source.lock().unwrap().is_none()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "start(catalog_emulation=True) needs at least one database: call \
+                 register_database(name) for each one, or set_lazy_catalog(source) to \
+                 report them from a live source",
+            ));
+        }
+
         // surface a failed bind (e.g. the port is taken) as a python OSError
         // instead of panicking the worker process.
         py.detach(|| self.run_server(tls, catalog_emulation, server_version))
@@ -2562,9 +2759,9 @@ impl Server {
                 disconnect_cb,
                 auth_cb,
             ));
-            let mut ctx_map: HashMap<String, Arc<SessionContext>> = HashMap::new();
-
             // Clone the Python lazy-catalog source out of the server, if one was set.
+            // A source is authoritative for user objects when present, so the
+            // eager register_* calls are ignored rather than merged.
             let lazy_source = self
                 .lazy_catalog_source
                 .lock()
@@ -2572,77 +2769,20 @@ impl Server {
                 .as_ref()
                 .map(|o| Python::attach(|py| o.clone_ref(py)));
 
-            if let Some(obj) = lazy_source {
-                // Lazy path: a single catalog context whose pg_catalog /
-                // information_schema tables (and views) are sourced from Python on
-                // every scan. Built BEFORE the views are created so they bind to
-                // the lazy providers. Eager register_* is skipped below.
-                let source: Arc<dyn LazyCatalogSource> = Arc::new(PyLazyCatalogSource { obj });
-                let (raw_ctx, _) = get_base_session_context_with_lazy_catalog(
-                    None,
-                    "datafusion".to_string(),
-                    "public".to_string(),
-                    None,
-                    source,
-                    LazyCatalogOptions::all(),
-                )
-                .await
-                .unwrap();
-                ctx_map.insert("datafusion".to_string(), Arc::new(raw_ctx));
-            } else if self.databases.is_empty() {
-                if catalog_emulation {
-                    let (raw_ctx, _) = get_base_session_context(
-                        None,
-                        "datafusion".to_string(),
-                        "public".to_string(),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                    ctx_map.insert("datafusion".to_string(), Arc::new(raw_ctx));
-                } else {
-                    let raw_ctx = SessionContext::new();
-                    ctx_map.insert("datafusion".to_string(), Arc::new(raw_ctx));
-                }
-            } else {
-                for db in &self.databases {
-                    let (raw_ctx, _) =
-                        get_base_session_context(None, db.to_string(), "main".to_string(), None)
-                            .await
-                            .unwrap();
-                    ctx_map.insert(db.clone(), Arc::new(raw_ctx));
-                }
-            }
-
-            // The eager registrations are mutually exclusive with the lazy source:
-            // when a source is installed it is authoritative for user objects.
-            if self.lazy_catalog_source.lock().unwrap().is_none() {
-                for ctx in ctx_map.values() {
-                    for db in &self.databases {
-                        register_user_database(ctx, db).await.unwrap();
-                    }
-                }
-
-                for (db, schema) in &self.schemas {
-                    if let Some(c) = ctx_map.get(db) {
-                        register_schema(c, db, schema).await.unwrap();
-                    }
-                }
-
-                for (db, schema, table, cols) in &self.tables {
-                    if let Some(c) = ctx_map.get(db) {
-                        // register_user_tables identifies the schema by OID; register_schema
-                        // is idempotent and returns the OID of the existing-or-created schema.
-                        let schema_oid = register_schema(c, db, schema).await.unwrap();
-                        register_user_tables(c, db, schema_oid, table, cols.clone())
-                            .await
-                            .unwrap();
-                    }
-                }
-            }
-
-            let ctx_map = Arc::new(ctx_map);
-            let default_ctx = ctx_map.values().next().unwrap().clone();
+            // Nothing is built here. Each database's context is built the first
+            // time a client connects to it, so the server binds immediately and
+            // a database that appears later needs no restart.
+            let catalog = catalog_emulation.then(|| {
+                let registrations = match lazy_source {
+                    Some(obj) => CatalogRegistrations::LazySource(obj),
+                    None => CatalogRegistrations::Declared {
+                        databases: self.databases.clone(),
+                        schemas: self.schemas.clone(),
+                        tables: self.tables.clone(),
+                    },
+                };
+                Arc::new(CatalogContexts::new(registrations))
+            });
 
             let listener = bind_listener(&addr)?;
             info!("Listening on {}", addr);
@@ -2654,8 +2794,7 @@ impl Server {
                     None
                 };
                 let py_worker = py_worker.clone();
-                let ctx_map = ctx_map.clone();
-                let default_ctx = default_ctx.clone();
+                let catalog = catalog.clone();
                 let server_version = server_version.clone();
                 async move {
                     loop {
@@ -2673,14 +2812,16 @@ impl Server {
                             }
                         };
                         {
-                            let conn_ctx =
-                                SessionContext::new_with_state(default_ctx.state().clone());
-                            let conn_ctx = Arc::new(conn_ctx);
+                            // The connection has no context yet: which database
+                            // it belongs to arrives in the startup message, and
+                            // that database's context may not be built.
+                            let conn_ctx: Arc<Mutex<Option<Arc<SessionContext>>>> =
+                                Arc::new(Mutex::new(None));
 
                             let query_runner: Arc<dyn QueryRunner> = if catalog_emulation {
                                 Arc::new(RouterQueryRunner {
                                     py_worker: py_worker.clone(),
-                                    catalog_ctx: Arc::new(Mutex::new(conn_ctx.clone())),
+                                    catalog_ctx: conn_ctx.clone(),
                                 })
                             } else {
                                 Arc::new(DirectQueryRunner {
@@ -2692,8 +2833,8 @@ impl Server {
                             let (id_tx, id_rx) = oneshot::channel();
 
                             let handler = Arc::new(RiffqProcessor {
-                                ctx: Arc::new(Mutex::new(conn_ctx.clone())),
-                                ctx_map: ctx_map.clone(),
+                                ctx: conn_ctx,
+                                catalog: catalog.clone(),
                                 py_worker: py_worker.clone(),
                                 conn_id_sender: Arc::new(Mutex::new(Some(id_tx))),
                                 query_runner: query_runner.clone(),

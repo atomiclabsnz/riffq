@@ -192,6 +192,13 @@ class RiffqServer:
         source's objects. A duplicate object (same name in the same scope) is an
         error; a source object whose name collides with a built-in replaces it.
 
+        The databases ``databases(callback)`` reports are the connectable ones:
+        each gets its own catalog, built on first connect, and a client asking
+        for a name the source does not report is refused with
+        ``FATAL 3D000 database "..." does not exist``. The source is asked afresh
+        on every connection, so a database it starts reporting after the server
+        started is reachable without a restart.
+
         When a lazy source is set, the eager ``register_*`` registrations are
         ignored. Requires ``start(catalog_emulation=True)``.
 
@@ -201,14 +208,26 @@ class RiffqServer:
         self._server.set_lazy_catalog(source)
 
     def register_database(self, database_name: str) -> None:
-        """Register a logical database for catalog emulation.
+        """Register a database for catalog emulation.
 
         When `start(catalog_emulation=True)` is used, the server responds to
         client metadata queries (pg_catalog) using entries registered via these
         helpers.
 
+        A registered database is also a *connectable* one, and the only kind:
+        each gets its own catalog, built the first time a client connects to it,
+        and a client asking for any other name is refused with
+        ``FATAL 3D000 database "..." does not exist`` as PostgreSQL does. So the
+        name registered here is the name clients must use in their connection
+        string, and a server that emulates the catalog needs at least one - with
+        none, `start(catalog_emulation=True)` raises rather than accepting a port
+        it could never serve anyone on.
+
+        None of this applies without `catalog_emulation`: there the host answers
+        catalog queries itself and any database name connects.
+
         Args:
-            database_name: Name of the database to expose via `pg_catalog`.
+            database_name: Name of the database to expose and accept.
         """
         self._server.register_database(database_name)
 

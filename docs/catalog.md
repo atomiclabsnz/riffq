@@ -278,9 +278,44 @@ WHERE oid = 'myhash'::oid;
 
 ```
 
+## Databases are connectable, not just listed
+
+A registered database is the unit of isolation. Each one gets its own catalog,
+built the first time a client connects to it, showing that database's schemas
+and tables and no other database's - the same thing a PostgreSQL connection
+sees. `pg_database` still lists every database from any of them.
+
+That makes the registered name the name clients connect under:
+
+```python
+server.register_database("mydb")
+server.start(catalog_emulation=True)
+```
+
+```
+psql "postgresql://user@127.0.0.1:5433/mydb"   # served
+psql "postgresql://user@127.0.0.1:5433/other"  # FATAL: database "other" does not exist
+```
+
+Connecting under an unregistered name is refused with PostgreSQL's own
+`3D000`, and the error lists the databases that do exist. A server started with
+`catalog_emulation=True` and no databases at all raises from `start()`, rather
+than binding a port it could never serve anyone on.
+
+With a lazy source the reported databases play the same role, and because the
+source is consulted on every connection, a database it starts reporting later is
+reachable without a restart.
+
+None of this applies without `catalog_emulation`: there riffq holds no catalog,
+the host answers metadata queries itself, and any database name connects.
+
 ## API Reference
 
-### Register a logical database name 
+### Register a database name
+
+Registers the database for `pg_catalog` and makes it connectable under that
+name. See [Databases are connectable, not just
+listed](#databases-are-connectable-not-just-listed).
 
 ```python
 RiffqServer.register_database(database_name: str) -> None:

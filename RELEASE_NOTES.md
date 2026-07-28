@@ -1,5 +1,49 @@
 # Release Notes
 
+## release-0.2.0
+
+### Breaking: a registered database is the only connectable database
+
+With `catalog_emulation=True`, a client connecting under a database name the
+host never registered is now refused with `FATAL 3D000 database "..." does not
+exist`, the way PostgreSQL refuses it. Previously any name connected and was
+quietly served some other database's catalog.
+
+The fix is one line - connect under the name you registered:
+
+```python
+server.register_database("mydb")          # already there
+# psql postgresql://user@host:5433/mydb   <- use this name
+```
+
+A server started with `catalog_emulation=True` and no databases registered at
+all now raises from `start()` instead of binding a port and refusing every
+client. Register one, or install a lazy source that reports one.
+
+**Servers started without `catalog_emulation` are unaffected**: riffq holds no
+catalog there, the host answers metadata queries itself, and any database name
+still connects.
+
+Most existing code already registers a database and connects under some other
+name without noticing, because the old fallback hid it - worth checking the
+connection strings rather than assuming.
+
+### One catalog context per database
+
+Each database now gets its own catalog, built in full the first time a client
+connects to it rather than at startup. Consequences:
+
+- A connection sees only its own database's schemas, tables and columns.
+  `pg_database` still lists every database from any of them.
+- `information_schema` reports the connected database in `table_catalog`, and it
+  agrees with `current_database()`. On the lazy path both used to disagree, with
+  48 views reporting the internal name `datafusion`.
+- A database that appears after the server started - one an ATTACH or a lazy
+  source turns up later - is connectable without a restart.
+- The server binds its port immediately. The per-database build cost (roughly a
+  second) is paid by the first connection to each database instead of by
+  startup, and only for databases something actually connects to.
+
 ## release-0.1.10
 
 The `release-0.1.8` and `release-0.1.9` tags never reached PyPI - both were built

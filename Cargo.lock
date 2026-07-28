@@ -3133,7 +3133,7 @@ dependencies = [
 
 [[package]]
 name = "riffq"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-schema",

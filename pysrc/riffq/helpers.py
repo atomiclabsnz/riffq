@@ -31,12 +31,26 @@ def stable_oid(salt: str, *parts: str) -> int:
         parts: The name components that identify the object within its class,
             such as ``(database, schema, relation)`` for a table.
 
+    Each component is length-prefixed before hashing rather than joined by a
+    separator, so no name can imitate the boundary between components: with a
+    plain separator, ``("s1", "t1")`` and the single part ``"s1\\x00t1"`` hash
+    identically, and so do a salt and a first part run together. Length-prefixing
+    makes the encoding one-to-one, so two different objects cannot be spelled
+    into one OID.
+
+    This is a host-side convenience, not the catalog's own numbering: OIDs a
+    lazy source supplies are taken as given and never rewritten, while a host
+    that supplies none gets an auto-increment counter from the catalog itself.
+    A host using this must keep an object's parts stable across restarts, or
+    that object's OID changes with them.
+
     Returns:
         A deterministic OID in the range ``[FIRST_USER_OID, FIRST_USER_OID + 2e9)``.
     """
     accumulator = 5381
-    for character in (salt + "\x00" + "\x00".join(parts)):
-        accumulator = (accumulator * 33 + ord(character)) & 0x7FFFFFFF
+    for component in (salt, *parts):
+        for character in f"{len(component)}:{component}":
+            accumulator = (accumulator * 33 + ord(character)) & 0x7FFFFFFF
     return FIRST_USER_OID + (accumulator % 2_000_000_000)
 
 _type = {

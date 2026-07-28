@@ -2,7 +2,7 @@ import atexit
 import duckdb
 import pyarrow as pa
 import riffq
-from riffq.helpers import to_arrow
+from riffq.helpers import stable_oid, to_arrow
 import logging
 import threading
 from pathlib import Path
@@ -63,18 +63,11 @@ def duckdb_type_to_oid(data_type: str) -> int:
     return 25  # text / varchar / everything else
 
 
-def _stable_oid(salt: str, *parts: str) -> int:
-    """Derive a stable, built-in-clear OID from a namespace `salt` and `parts`.
-
-    The same inputs always yield the same OID (so ``pg_class.oid`` and
-    ``pg_attribute.attrelid`` agree across scans and joins resolve), distinct
-    object classes use distinct salts to avoid collisions, and the result sits
-    well above the built-in OID range and inside the signed-32-bit range that
-    the catalog row types use.
-    """
-    key = "\x00".join((salt,) + parts)
-    h = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16)
-    return 16384 + (h % 2_000_000_000)
+# One OID derivation, riffq's shipped one, rather than a second implementation
+# here: a catalog source has to hand the same object the same OID on every scan
+# and every restart, and two hash functions maintained separately drift apart
+# without anything failing loudly. This used to be its own SHA1 variant.
+_stable_oid = stable_oid
 
 
 class DuckdbCatalogSource:
