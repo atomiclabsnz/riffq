@@ -66,7 +66,7 @@ def duckdb_type_to_oid(data_type: str) -> int:
 # One OID derivation, riffq's shipped one, rather than a second implementation
 # here: a catalog source has to hand the same object the same OID on every scan
 # and every restart, and two hash functions maintained separately drift apart
-# without anything failing loudly. This used to be its own SHA1 variant.
+# without anything failing loudly.
 _stable_oid = stable_oid
 
 
@@ -355,8 +355,7 @@ def run_server(
 
     # Drive pg_catalog lazily from the live DuckDB connection: every catalog
     # scan re-reads DuckDB's schema, so tables created after startup show up
-    # without any re-registration. (Replaces the previous eager walk that
-    # snapshotted databases/schemas/tables once at boot.)
+    # without any re-registration.
     server.set_lazy_catalog(DuckdbCatalogSource(duckdb_con))
 
     # riffq catches SIGINT/SIGTERM inside its tokio runtime and invokes this

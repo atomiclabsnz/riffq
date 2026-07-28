@@ -24,7 +24,7 @@ use tokio_rustls::rustls::ServerConfig;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -73,7 +73,7 @@ use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::response::ErrorResponse;
-use pgwire::messages::startup::Authentication;
+use pgwire::messages::startup::{Authentication, PasswordMessageFamily, Startup};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 
@@ -535,15 +535,52 @@ fn decimal_fraction_digits(scale: i8) -> u8 {
 ///
 /// Returns None for a NULL cell and for any Arrow type riffq has no text
 /// spelling for; both reach the client as SQL NULL.
-// One arm per Arrow DataType. Splitting the match would spread the type
-// coverage over several functions and make an unhandled type - which silently
-// becomes NULL on the wire - easy to miss.
-#[allow(clippy::too_many_lines)]
+///
+/// The match below is the one place every Arrow type riffq renders is listed,
+/// so a type that stops being handled - and would silently become NULL on the
+/// wire - is still visible here; each arm hands the cell to the renderer for
+/// its group of types.
 fn arrow_value_to_string(array: &dyn Array, row: usize) -> Option<String> {
     if array.is_null(row) {
         return None;
     }
 
+    match array.data_type() {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64 => render_number_as_text(array, row),
+        DataType::Boolean => Some(array.as_boolean().value(row).to_string()),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            render_string_as_text(array, row)
+        }
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+            render_date_or_timestamp_as_text(array, row)
+        }
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            render_decimal_as_text(array, row)
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            render_binary_as_hex_text(array, row)
+        }
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            render_list_as_braced_text(array, row)
+        }
+        _ => None,
+    }
+}
+
+/// Render an Arrow number cell in Rust's decimal spelling of the value.
+///
+/// Handles Int8, Int16, Int32, Int64, `UInt8`, `UInt16`, `UInt32`, `UInt64`, Float32
+/// and Float64. Any other type yields None, which the caller sends as NULL.
+fn render_number_as_text(array: &dyn Array, row: usize) -> Option<String> {
     match array.data_type() {
         DataType::Int8 => Some(
             array
@@ -605,13 +642,33 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Option<String> {
                 .value(row)
                 .to_string(),
         ),
-        DataType::Boolean => Some(array.as_boolean().value(row).to_string()),
+        _ => None,
+    }
+}
+
+/// Copy an Arrow string cell out as an owned `String`.
+///
+/// Handles Utf8, `LargeUtf8` and `Utf8View`. `DataFusion` 54 returns many
+/// `information_schema`/`pg_catalog` string columns as `Utf8View` (for example
+/// `information_schema.columns.column_name`), so leaving that type out would
+/// turn those columns into NULL on the wire. Any other type yields None.
+fn render_string_as_text(array: &dyn Array, row: usize) -> Option<String> {
+    match array.data_type() {
         DataType::Utf8 => Some(array.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => Some(array.as_string::<i64>().value(row).to_string()),
-        // DataFusion 54 returns many information_schema/pg_catalog string columns as
-        // Utf8View (e.g. information_schema.columns.column_name); without this arm they
-        // fall through to None and reach the client as NULL.
         DataType::Utf8View => Some(array.as_string_view().value(row).to_string()),
+        _ => None,
+    }
+}
+
+/// Render an Arrow date or timestamp cell as chrono's text spelling of the
+/// instant it names.
+///
+/// Handles Date32 (days since the epoch), Date64 (milliseconds since the
+/// epoch) and Timestamp in all four Arrow time units. Returns None for a date
+/// or instant chrono cannot represent, and for any other type.
+fn render_date_or_timestamp_as_text(array: &dyn Array, row: usize) -> Option<String> {
+    match array.data_type() {
         DataType::Date32 => {
             let days = i64::from(
                 array
@@ -629,35 +686,61 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Option<String> {
             Some(dt.to_string())
         }
         DataType::Timestamp(unit, _) => {
-            let nanos: i128 = match unit {
-                TimeUnit::Second => {
-                    i128::from(array.as_primitive::<TimestampSecondType>().value(row))
-                        * 1_000_000_000
-                }
-                TimeUnit::Millisecond => {
-                    i128::from(array.as_primitive::<TimestampMillisecondType>().value(row))
-                        * 1_000_000
-                }
-                TimeUnit::Microsecond => {
-                    i128::from(array.as_primitive::<TimestampMicrosecondType>().value(row)) * 1_000
-                }
-                TimeUnit::Nanosecond => {
-                    i128::from(array.as_primitive::<TimestampNanosecondType>().value(row))
-                }
-            };
-            let dt = timestamp_nanos_to_datetime(nanos)?;
+            let dt = timestamp_nanos_to_datetime(timestamp_value_as_nanos(array, row, *unit))?;
             Some(dt.to_string())
         }
-        DataType::Decimal128(_p, scale) => {
+        _ => None,
+    }
+}
+
+/// Read one Arrow timestamp cell as a count of nanoseconds since the epoch.
+///
+/// The count is an i128 because a second- or millisecond-unit timestamp scaled
+/// up to nanoseconds does not fit in the i64 Arrow stores it in.
+fn timestamp_value_as_nanos(array: &dyn Array, row: usize, unit: TimeUnit) -> i128 {
+    match unit {
+        TimeUnit::Second => {
+            i128::from(array.as_primitive::<TimestampSecondType>().value(row)) * 1_000_000_000
+        }
+        TimeUnit::Millisecond => {
+            i128::from(array.as_primitive::<TimestampMillisecondType>().value(row)) * 1_000_000
+        }
+        TimeUnit::Microsecond => {
+            i128::from(array.as_primitive::<TimestampMicrosecondType>().value(row)) * 1_000
+        }
+        TimeUnit::Nanosecond => {
+            i128::from(array.as_primitive::<TimestampNanosecondType>().value(row))
+        }
+    }
+}
+
+/// Render an Arrow decimal cell with its point placed by the column's scale.
+///
+/// Handles Decimal128, whose unscaled value divides in Rust, and Decimal256,
+/// whose i256 value is rendered as digits and then has the point inserted.
+/// Any other type yields None.
+fn render_decimal_as_text(array: &dyn Array, row: usize) -> Option<String> {
+    match array.data_type() {
+        DataType::Decimal128(_precision, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             let raw: i128 = arr.value(row);
             Some(format_decimal_i128(raw, decimal_fraction_digits(*scale)))
         }
-        DataType::Decimal256(_p, scale) => {
+        DataType::Decimal256(_precision, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
             let s = arr.value(row).to_string();
             Some(insert_decimal_point(&s, decimal_fraction_digits(*scale)))
         }
+        _ => None,
+    }
+}
+
+/// Render an Arrow binary cell in `PostgreSQL`'s `\x` hex bytea spelling.
+///
+/// Handles Binary, `LargeBinary` and `FixedSizeBinary`. Any other type yields
+/// None.
+fn render_binary_as_hex_text(array: &dyn Array, row: usize) -> Option<String> {
+    match array.data_type() {
         DataType::Binary => {
             let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
             Some(hex_bytea(arr.value(row)))
@@ -673,42 +756,50 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Option<String> {
                 .unwrap();
             Some(hex_bytea(arr.value(row)))
         }
-        DataType::List(_) => {
-            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
-            let values = list.value(row);
-            let mut parts = Vec::new();
-            for i in 0..values.len() {
-                match arrow_value_to_string(values.as_ref(), i) {
-                    Some(v) => parts.push(v),
-                    None => parts.push("NULL".to_string()),
-                }
-            }
-            Some(format!("{{{}}}", parts.join(",")))
-        }
-        DataType::LargeList(_) => {
-            let list = array.as_any().downcast_ref::<LargeListArray>().unwrap();
-            let values = list.value(row);
-            let mut parts = Vec::new();
-            for i in 0..values.len() {
-                match arrow_value_to_string(values.as_ref(), i) {
-                    Some(v) => parts.push(v),
-                    None => parts.push("NULL".to_string()),
-                }
-            }
-            Some(format!("{{{}}}", parts.join(",")))
-        }
-        DataType::FixedSizeList(_, _) => {
-            let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-            let values = list.value(row);
-            let mut parts = Vec::new();
-            for i in 0..values.len() {
-                match arrow_value_to_string(values.as_ref(), i) {
-                    Some(v) => parts.push(v),
-                    None => parts.push("NULL".to_string()),
-                }
-            }
-            Some(format!("{{{}}}", parts.join(",")))
-        }
+        _ => None,
+    }
+}
+
+/// Render an Arrow list cell in `PostgreSQL`'s `{a,b,c}` array literal
+/// spelling, with a NULL element written as the word NULL.
+///
+/// Handles List, `LargeList` and `FixedSizeList`. Any other type yields None.
+fn render_list_as_braced_text(array: &dyn Array, row: usize) -> Option<String> {
+    let values = list_cell_values(array, row)?;
+    let parts: Vec<String> = (0..values.len())
+        .map(|i| arrow_value_to_string(values.as_ref(), i).unwrap_or_else(|| "NULL".to_string()))
+        .collect();
+    Some(format!("{{{}}}", parts.join(",")))
+}
+
+/// The array holding the elements of one Arrow list cell.
+///
+/// Handles List, `LargeList` and `FixedSizeList`, whose elements are reached
+/// through three different concrete array types. Returns None for an array
+/// that is not a list at all.
+fn list_cell_values(array: &dyn Array, row: usize) -> Option<ArrayRef> {
+    match array.data_type() {
+        DataType::List(_) => Some(
+            array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::LargeList(_) => Some(
+            array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::FixedSizeList(_, _) => Some(
+            array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap()
+                .value(row),
+        ),
         _ => None,
     }
 }
@@ -720,30 +811,12 @@ fn arrow_value_to_string(array: &dyn Array, row: usize) -> Option<String> {
 /// `Vec<String>` with no way to say "this element is NULL". A non-list array
 /// yields an empty vector.
 fn arrow_list_to_vec(array: &dyn Array, row: usize) -> Vec<String> {
-    match array.data_type() {
-        DataType::List(_) => {
-            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
-            let values = list.value(row);
-            (0..values.len())
-                .map(|i| arrow_value_to_string(values.as_ref(), i).unwrap_or_default())
-                .collect()
-        }
-        DataType::LargeList(_) => {
-            let list = array.as_any().downcast_ref::<LargeListArray>().unwrap();
-            let values = list.value(row);
-            (0..values.len())
-                .map(|i| arrow_value_to_string(values.as_ref(), i).unwrap_or_default())
-                .collect()
-        }
-        DataType::FixedSizeList(_, _) => {
-            let list = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-            let values = list.value(row);
-            (0..values.len())
-                .map(|i| arrow_value_to_string(values.as_ref(), i).unwrap_or_default())
-                .collect()
-        }
-        _ => vec![],
-    }
+    let Some(values) = list_cell_values(array, row) else {
+        return vec![];
+    };
+    (0..values.len())
+        .map(|i| arrow_value_to_string(values.as_ref(), i).unwrap_or_default())
+        .collect()
 }
 
 /// Append one Arrow value to a `DataRow` in the format the client asked for.
@@ -752,10 +825,11 @@ fn arrow_list_to_vec(array: &dyn Array, row: usize) -> Vec<String> {
 /// raw in binary and as `\x...` hex in text. An Arrow type riffq cannot encode
 /// is written as NULL rather than aborting the row, so an unexpected column
 /// type costs one value instead of the whole query.
-// One arm per Arrow DataType. Splitting the match would spread the type
-// coverage over several functions and make an unhandled type - which silently
-// becomes NULL on the wire - easy to miss.
-#[allow(clippy::too_many_lines)]
+///
+/// The match below is the one place every Arrow type riffq encodes is listed,
+/// so a type that stops being handled - and would silently become NULL on the
+/// wire - is still visible here; each arm hands the cell to the encoder for
+/// its group of types.
 fn encode_arrow_value(
     encoder: &mut DataRowEncoder,
     array: &dyn Array,
@@ -766,54 +840,117 @@ fn encode_arrow_value(
         return encoder.encode_field(&Option::<i32>::None); // type will be ignored
     }
     match array.data_type() {
-        DataType::Decimal128(_p, scale) => {
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            encode_decimal_field(encoder, array, row)
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            encode_binary_field(encoder, array, row, format)
+        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64 => encode_number_field(encoder, array, row),
+        DataType::Boolean => encoder.encode_field(&Some(array.as_boolean().value(row))),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            encode_string_field(encoder, array, row)
+        }
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+            encode_date_or_timestamp_field(encoder, array, row)
+        }
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            let vec = arrow_list_to_vec(array, row);
+            encoder.encode_field(&vec)
+        }
+        _ => encoder.encode_field(&Option::<&str>::None),
+    }
+}
+
+/// Encode an Arrow decimal cell as digits with the point placed by the
+/// column's scale.
+///
+/// Handles Decimal128, whose unscaled value divides in Rust, and Decimal256,
+/// whose i256 value is rendered as digits and then has the point inserted.
+/// Any other type is written as NULL.
+fn encode_decimal_field(
+    encoder: &mut DataRowEncoder,
+    array: &dyn Array,
+    row: usize,
+) -> PgWireResult<()> {
+    match array.data_type() {
+        DataType::Decimal128(_precision, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
             let raw: i128 = arr.value(row);
             let s = format_decimal_i128(raw, decimal_fraction_digits(*scale));
             encoder.encode_field(&Some(s))
         }
-        DataType::Decimal256(_p, scale) => {
+        DataType::Decimal256(_precision, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal256Array>().unwrap();
             let s =
                 insert_decimal_point(&arr.value(row).to_string(), decimal_fraction_digits(*scale));
             encoder.encode_field(&Some(s))
         }
-        DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-            let bytes = arr.value(row);
-            match format {
-                FieldFormat::Binary => encoder.encode_field(&Some(bytes)),
-                FieldFormat::Text => {
-                    let s = hex_bytea(bytes);
-                    encoder.encode_field(&Some(s))
-                }
-            }
+        _ => encoder.encode_field(&Option::<&str>::None),
+    }
+}
+
+/// Encode an Arrow binary cell as bytea: the raw bytes in binary format, and
+/// the `\x...` hex spelling in text format.
+///
+/// Handles Binary, `LargeBinary` and `FixedSizeBinary`. Any other type is written
+/// as NULL.
+fn encode_binary_field(
+    encoder: &mut DataRowEncoder,
+    array: &dyn Array,
+    row: usize,
+    format: FieldFormat,
+) -> PgWireResult<()> {
+    let bytes = match array.data_type() {
+        DataType::Binary => array
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(row),
+        DataType::LargeBinary => array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap()
+            .value(row),
+        DataType::FixedSizeBinary(_) => array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap()
+            .value(row),
+        _ => return encoder.encode_field(&Option::<&str>::None),
+    };
+    match format {
+        FieldFormat::Binary => encoder.encode_field(&Some(bytes)),
+        FieldFormat::Text => {
+            let s = hex_bytea(bytes);
+            encoder.encode_field(&Some(s))
         }
-        DataType::LargeBinary => {
-            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            let bytes = arr.value(row);
-            match format {
-                FieldFormat::Binary => encoder.encode_field(&Some(bytes)),
-                FieldFormat::Text => {
-                    let s = hex_bytea(bytes);
-                    encoder.encode_field(&Some(s))
-                }
-            }
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .unwrap();
-            let bytes = arr.value(row);
-            match format {
-                FieldFormat::Binary => encoder.encode_field(&Some(bytes)),
-                FieldFormat::Text => {
-                    let s = hex_bytea(bytes);
-                    encoder.encode_field(&Some(s))
-                }
-            }
-        }
+    }
+}
+
+/// Encode an Arrow number cell as the `PostgreSQL` integer or float type that
+/// `src/pg/arrow_map.rs` advertises for its Arrow type.
+///
+/// Handles Int8, Int16, Int32, Int64, `UInt8`, `UInt16`, `UInt32`, `UInt64`, Float32
+/// and Float64. `UInt8`, `UInt16` and `UInt32` widen into the next signed type up,
+/// which is what the advertised OID promises the client; `UInt64` has nothing
+/// wider to widen into, as the comment on its arm explains. Any other type is
+/// written as NULL.
+fn encode_number_field(
+    encoder: &mut DataRowEncoder,
+    array: &dyn Array,
+    row: usize,
+) -> PgWireResult<()> {
+    match array.data_type() {
         DataType::Int8 => encoder.encode_field(&Some(i16::from(
             array
                 .as_primitive::<arrow::array::types::Int8Type>()
@@ -849,9 +986,13 @@ fn encode_arrow_value(
                 .as_primitive::<arrow::array::types::UInt32Type>()
                 .value(row),
         ))),
-        // PostgreSQL's widest integer is int8, which is what UInt64 columns are
-        // advertised as, so a value above i64::MAX has no representable form
-        // here and is sent with its bit pattern reinterpreted as signed.
+        // Not a bounded conversion: a UInt64 value above i64::MAX is reinterpreted
+        // as a negative i64 and the client is told a wrong number. It cannot be
+        // encoded correctly here because src/pg/arrow_map.rs advertises UInt64
+        // columns as INT8 and PostgreSQL has no wider integer type, so the value
+        // has nowhere to go on the wire. Sending it right needs the column
+        // advertised as a different type (NUMERIC), which is a wire-format change
+        // and out of scope here.
         DataType::UInt64 => encoder.encode_field(&Some(
             array
                 .as_primitive::<arrow::array::types::UInt64Type>()
@@ -868,13 +1009,43 @@ fn encode_arrow_value(
                 .as_primitive::<arrow::array::types::Float64Type>()
                 .value(row),
         )),
-        DataType::Boolean => encoder.encode_field(&Some(array.as_boolean().value(row))),
+        _ => encoder.encode_field(&Option::<&str>::None),
+    }
+}
+
+/// Encode an Arrow string cell as `PostgreSQL` text.
+///
+/// Handles Utf8, `LargeUtf8` and `Utf8View`. `DataFusion` 54 returns many
+/// `information_schema`/`pg_catalog` string columns as `Utf8View` (for example
+/// `information_schema.columns.column_name`), so leaving that type out would
+/// turn those columns into NULL on the wire. Any other type is written as
+/// NULL.
+fn encode_string_field(
+    encoder: &mut DataRowEncoder,
+    array: &dyn Array,
+    row: usize,
+) -> PgWireResult<()> {
+    match array.data_type() {
         DataType::Utf8 => encoder.encode_field(&Some(array.as_string::<i32>().value(row))),
         DataType::LargeUtf8 => encoder.encode_field(&Some(array.as_string::<i64>().value(row))),
-        // DataFusion 54 returns many information_schema/pg_catalog string columns as
-        // Utf8View (e.g. information_schema.columns.column_name); without this arm they
-        // fall through to the NULL default and reach the client as NULL.
         DataType::Utf8View => encoder.encode_field(&Some(array.as_string_view().value(row))),
+        _ => encoder.encode_field(&Option::<&str>::None),
+    }
+}
+
+/// Encode an Arrow date or timestamp cell as the chrono value pgwire turns
+/// into a `PostgreSQL` date or timestamp.
+///
+/// Handles Date32 (days since the epoch), Date64 (milliseconds since the
+/// epoch) and Timestamp in all four Arrow time units. A date or instant chrono
+/// cannot represent is written as NULL, which costs one value rather than the
+/// whole row. Any other type is written as NULL too.
+fn encode_date_or_timestamp_field(
+    encoder: &mut DataRowEncoder,
+    array: &dyn Array,
+    row: usize,
+) -> PgWireResult<()> {
+    match array.data_type() {
         DataType::Date32 => {
             let days = i64::from(
                 array
@@ -894,30 +1065,10 @@ fn encode_arrow_value(
             }
         }
         DataType::Timestamp(unit, _) => {
-            let nanos: i128 = match unit {
-                TimeUnit::Second => {
-                    i128::from(array.as_primitive::<TimestampSecondType>().value(row))
-                        * 1_000_000_000
-                }
-                TimeUnit::Millisecond => {
-                    i128::from(array.as_primitive::<TimestampMillisecondType>().value(row))
-                        * 1_000_000
-                }
-                TimeUnit::Microsecond => {
-                    i128::from(array.as_primitive::<TimestampMicrosecondType>().value(row)) * 1_000
-                }
-                TimeUnit::Nanosecond => {
-                    i128::from(array.as_primitive::<TimestampNanosecondType>().value(row))
-                }
-            };
-            match timestamp_nanos_to_datetime(nanos) {
+            match timestamp_nanos_to_datetime(timestamp_value_as_nanos(array, row, *unit)) {
                 Some(dt) => encoder.encode_field(&Some(dt)),
                 None => encoder.encode_field(&Option::<&str>::None),
             }
-        }
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-            let vec = arrow_list_to_vec(array, row);
-            encoder.encode_field(&vec)
         }
         _ => encoder.encode_field(&Option::<&str>::None),
     }
@@ -1056,7 +1207,350 @@ mod encode_tests {
 /// whether a password should be demanded before it has anything to ask about.
 pub struct PythonWorker {
     sender: Sender<WorkerMessage>,
-    auth_cb: Arc<Mutex<Option<Py<PyAny>>>>,
+    auth_cb: CallbackSlot,
+}
+
+/// Where one of the host's Python callbacks lives: empty until the host
+/// installs it, and shared between the worker thread and the API that installs
+/// it, which is why it is behind an `Arc<Mutex<..>>`.
+type CallbackSlot = Arc<Mutex<Option<Py<PyAny>>>>;
+
+/// The Python object a host installed in `slot`, or None if it installed
+/// nothing.
+///
+/// The object is cloned under the GIL so the caller can invoke it without
+/// holding the slot's lock, which leaves the host free to replace the callback
+/// while one of its calls is running.
+///
+/// # Panics
+///
+/// Panics if the slot's lock is poisoned, which means a previous caller
+/// panicked while holding it.
+fn clone_installed_callback(slot: &CallbackSlot) -> Option<Py<PyAny>> {
+    Python::attach(|py| slot.lock().unwrap().as_ref().map(|cb| cb.clone_ref(py)))
+}
+
+/// Serve `WorkerMessage`s on the Python thread until the channel closes.
+///
+/// Initialises the interpreter and then handles one message at a time, so
+/// every host callback is invoked from the same thread in the order the
+/// messages were sent. The match below is the one place every `WorkerMessage`
+/// variant is listed, so a variant that stops being answered - which would
+/// leave its sender waiting on a responder forever - is still visible here.
+///
+/// Returns when the last `PythonWorker` is dropped and the channel closes.
+fn run_python_worker_loop(
+    receiver: &Receiver<WorkerMessage>,
+    query_cb: &CallbackSlot,
+    connect_cb: &CallbackSlot,
+    disconnect_cb: &CallbackSlot,
+    auth_cb: &CallbackSlot,
+) {
+    info!("[PY_WORKER] Thread started");
+    pyo3::Python::initialize();
+    loop {
+        debug!("[PY_WORKER] waiting to receive on rx...");
+        let Ok(msg) = receiver.recv() else {
+            info!("[PY_WORKER] Channel closed");
+            break;
+        };
+        match msg {
+            WorkerMessage::Query {
+                query,
+                params,
+                param_types,
+                do_describe,
+                connection_id,
+                responder,
+            } => run_query_callback(
+                query_cb,
+                &query,
+                params.as_deref(),
+                param_types.as_deref(),
+                do_describe,
+                connection_id,
+                responder,
+            ),
+            WorkerMessage::Connect {
+                connection_id,
+                ip,
+                port,
+                server_name,
+                responder,
+            } => ask_connect_callback(
+                connect_cb,
+                connection_id,
+                &ip,
+                port,
+                server_name.as_deref(),
+                responder,
+            ),
+            WorkerMessage::Disconnect {
+                connection_id,
+                ip,
+                port,
+            } => announce_disconnect_to_callback(disconnect_cb, connection_id, &ip, port),
+            WorkerMessage::Authentication {
+                connection_id,
+                user,
+                database,
+                host,
+                password,
+                responder,
+            } => ask_authentication_callback(
+                auth_cb,
+                connection_id,
+                user.as_deref(),
+                database.as_deref(),
+                &host,
+                &password,
+                responder,
+            ),
+        }
+    }
+}
+
+/// Hand one statement to the host's `on_query` callback.
+///
+/// The callback is given a `CallbackWrapper` to answer through, so a host may
+/// reply from another thread, at any later time. With no callback installed
+/// the responder is dropped instead, which its sender reads as an empty
+/// result: there is nobody who could run the query.
+///
+/// # Panics
+///
+/// Panics if Python rejects the argument objects riffq builds here, which
+/// would mean the interpreter is in an unusable state.
+fn run_query_callback(
+    query_cb: &CallbackSlot,
+    query: &str,
+    params: Option<&[Option<Bytes>]>,
+    param_types: Option<&[Type]>,
+    do_describe: bool,
+    connection_id: u64,
+    responder: oneshot::Sender<QueryResult>,
+) {
+    debug!("[PY_WORKER] received query: {connection_id} -- {query}");
+    let Some(cb) = clone_installed_callback(query_cb) else {
+        return;
+    };
+    Python::attach(|py| {
+        debug!("[PY_WORKER] GIL acquired, invoking callback");
+        let wrapper = Py::new(
+            py,
+            CallbackWrapper {
+                responder: Arc::new(Mutex::new(Some(responder))),
+            },
+        )
+        .unwrap();
+
+        let args = PyTuple::new(
+            py,
+            [
+                query.into_py_any(py).unwrap(),
+                wrapper.clone_ref(py).into_py_any(py).unwrap(),
+            ],
+        )
+        .unwrap();
+        let kwargs = PyDict::new(py);
+
+        // Add do_describe flag
+        kwargs.set_item("do_describe", do_describe).unwrap();
+
+        // Connection identifier
+        kwargs.set_item("connection_id", connection_id).unwrap();
+
+        if let Some(params) = params {
+            let py_args = bound_parameters_to_py_list(py, params, param_types);
+            kwargs.set_item("query_args", py_args).unwrap();
+        }
+
+        if let Err(e) = cb.call(py, args, Some(&kwargs)) {
+            e.print(py);
+        }
+    });
+}
+
+/// Decode the parameter values bound to one statement into a Python list, in
+/// the order the client sent them.
+///
+/// Iterates the values (rather than zipping them with the declared types): a
+/// client may send more values than declared types -- psqlodbc sends parameter
+/// values with no types at all -- and every value must still reach the
+/// handler. A value with no declared type is decoded as `Type::UNKNOWN`, which
+/// `decode_param` reads as text. A value riffq cannot decode becomes Python
+/// None.
+///
+/// # Panics
+///
+/// Panics if appending to a freshly created Python list fails, which would
+/// mean the interpreter is in an unusable state.
+fn bound_parameters_to_py_list<'py>(
+    py: Python<'py>,
+    params: &[Option<Bytes>],
+    param_types: Option<&[Type]>,
+) -> Bound<'py, PyList> {
+    let py_args = PyList::empty(py);
+    for (index, val) in params.iter().enumerate() {
+        let ty = param_types
+            .and_then(|types| types.get(index))
+            .unwrap_or(&Type::UNKNOWN);
+        let decoded = match val {
+            None => None,
+            Some(bytes) => decode_param(py, &bytes[..], ty),
+        };
+        match decoded {
+            Some(obj) => py_args.append(obj).unwrap(),
+            None => py_args.append(py.None()).unwrap(),
+        }
+    }
+    py_args
+}
+
+/// Ask the host's `on_connect` callback whether to admit a client.
+///
+/// The callback answers through a `BoolCallbackWrapper`, so a host may decide
+/// asynchronously. With no callback installed every client is admitted, which
+/// is what a server that never asked to vet connections expects.
+///
+/// # Panics
+///
+/// Panics if Python rejects the argument objects riffq builds here, which
+/// would mean the interpreter is in an unusable state.
+fn ask_connect_callback(
+    connect_cb: &CallbackSlot,
+    connection_id: u64,
+    ip: &str,
+    port: u16,
+    server_name: Option<&str>,
+    responder: oneshot::Sender<BoolCallbackResult>,
+) {
+    let Some(cb) = clone_installed_callback(connect_cb) else {
+        let _ = responder.send(BoolCallbackResult {
+            allowed: true,
+            error: None,
+        });
+        return;
+    };
+    Python::attach(|py| {
+        let wrapper = Py::new(
+            py,
+            BoolCallbackWrapper {
+                responder: Arc::new(Mutex::new(Some(responder))),
+            },
+        )
+        .unwrap();
+        let args = PyTuple::new(
+            py,
+            [
+                connection_id.into_py_any(py).unwrap(),
+                ip.into_py_any(py).unwrap(),
+                port.into_py_any(py).unwrap(),
+            ],
+        )
+        .unwrap();
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("callback", wrapper.clone_ref(py)).unwrap();
+        if let Some(name) = server_name {
+            let _ = kwargs.set_item("server_name", name);
+        } else {
+            let _ = kwargs.set_item("server_name", py.None());
+        }
+        if let Err(e) = cb.call(py, args, Some(&kwargs)) {
+            e.print(py);
+        }
+    });
+}
+
+/// Tell the host's `on_disconnect` callback that a client has gone.
+///
+/// Nothing waits on an answer: the connection is already closed by the time
+/// this runs, so a host with no callback installed simply never hears about
+/// it.
+///
+/// # Panics
+///
+/// Panics if Python rejects the argument objects riffq builds here, which
+/// would mean the interpreter is in an unusable state.
+fn announce_disconnect_to_callback(
+    disconnect_cb: &CallbackSlot,
+    connection_id: u64,
+    ip: &str,
+    port: u16,
+) {
+    let Some(cb) = clone_installed_callback(disconnect_cb) else {
+        return;
+    };
+    Python::attach(|py| {
+        let args = PyTuple::new(
+            py,
+            [
+                connection_id.into_py_any(py).unwrap(),
+                ip.into_py_any(py).unwrap(),
+                port.into_py_any(py).unwrap(),
+            ],
+        )
+        .unwrap();
+        if let Err(e) = cb.call1(py, args) {
+            e.print(py);
+        }
+    });
+}
+
+/// Ask the host's `on_authentication` callback to verify a cleartext password.
+///
+/// The callback answers through a `BoolCallbackWrapper`, so a host may check
+/// the password asynchronously. With no callback installed every client is let
+/// in: a server whose host never installed one does not ask for a password in
+/// the first place.
+///
+/// # Panics
+///
+/// Panics if Python rejects the argument objects riffq builds here, which
+/// would mean the interpreter is in an unusable state.
+fn ask_authentication_callback(
+    auth_cb: &CallbackSlot,
+    connection_id: u64,
+    user: Option<&str>,
+    database: Option<&str>,
+    host: &str,
+    password: &str,
+    responder: oneshot::Sender<BoolCallbackResult>,
+) {
+    let Some(cb) = clone_installed_callback(auth_cb) else {
+        let _ = responder.send(BoolCallbackResult {
+            allowed: true,
+            error: None,
+        });
+        return;
+    };
+    Python::attach(|py| {
+        let wrapper = Py::new(
+            py,
+            BoolCallbackWrapper {
+                responder: Arc::new(Mutex::new(Some(responder))),
+            },
+        )
+        .unwrap();
+        let args = PyTuple::new(
+            py,
+            [
+                connection_id.into_py_any(py).unwrap(),
+                user.into_py_any(py).unwrap(),
+                password.into_py_any(py).unwrap(),
+                host.into_py_any(py).unwrap(),
+            ],
+        )
+        .unwrap();
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("callback", wrapper.clone_ref(py)).unwrap();
+        if let Some(db) = database {
+            kwargs.set_item("database", db).unwrap();
+        }
+        if let Err(e) = cb.call(py, args, Some(&kwargs)) {
+            e.print(py);
+        }
+    });
 }
 
 impl PythonWorker {
@@ -1066,234 +1560,16 @@ impl PythonWorker {
     /// until the channel closes, which happens when the last `PythonWorker` is
     /// dropped. Each callback is held behind its own lock so a host may still
     /// be installing them while the thread is already running.
-    // One arm per WorkerMessage variant. Splitting them into separate functions
-    // would scatter the message handling and make a variant that stops being
-    // answered - leaving its caller waiting on a responder forever - harder to
-    // spot.
-    #[allow(clippy::too_many_lines)]
     fn new(
-        query_cb: Arc<Mutex<Option<Py<PyAny>>>>,
-        connect_cb: Arc<Mutex<Option<Py<PyAny>>>>,
-        disconnect_cb: Arc<Mutex<Option<Py<PyAny>>>>,
-        auth_cb: Arc<Mutex<Option<Py<PyAny>>>>,
+        query_cb: CallbackSlot,
+        connect_cb: CallbackSlot,
+        disconnect_cb: CallbackSlot,
+        auth_cb: CallbackSlot,
     ) -> Self {
         let (tx, rx) = channel::<WorkerMessage>();
         let auth_cb_thread = auth_cb.clone();
         thread::spawn(move || {
-            info!("[PY_WORKER] Thread started");
-            pyo3::Python::initialize();
-            loop {
-                debug!("[PY_WORKER] waiting to receive on rx...");
-                if let Ok(msg) = rx.recv() {
-                    match msg {
-                        WorkerMessage::Query {
-                            query,
-                            params,
-                            param_types,
-                            do_describe,
-                            connection_id,
-                            responder,
-                        } => {
-                            debug!("[PY_WORKER] received query: {connection_id} -- {query}");
-                            let cb_opt = Python::attach(|py| {
-                                query_cb.lock().unwrap().as_ref().map(|cb| cb.clone_ref(py))
-                            });
-
-                            if let Some(cb) = cb_opt {
-                                Python::attach(|py| {
-                                    debug!("[PY_WORKER] GIL acquired, invoking callback");
-                                    let wrapper = Py::new(
-                                        py,
-                                        CallbackWrapper {
-                                            responder: Arc::new(Mutex::new(Some(responder))),
-                                        },
-                                    )
-                                    .unwrap();
-
-                                    let args = PyTuple::new(
-                                        py,
-                                        [
-                                            query.clone().into_py_any(py).unwrap(),
-                                            wrapper.clone_ref(py).into_py_any(py).unwrap(),
-                                        ],
-                                    )
-                                    .unwrap();
-                                    let kwargs = PyDict::new(py);
-
-                                    // Add do_describe flag
-                                    kwargs.set_item("do_describe", do_describe).unwrap();
-
-                                    // Connection identifier
-                                    kwargs.set_item("connection_id", connection_id).unwrap();
-
-                                    // Add query_args if present. Iterate the values
-                                    // (not a zip with the types): a client may send
-                                    // more values than declared types -- psqlodbc
-                                    // sends parameter values with no types at all --
-                                    // and every value must still reach the handler.
-                                    // A value with no declared type is decoded as
-                                    // Type::UNKNOWN, which decode_param reads as text.
-                                    if let Some(params) = &params {
-                                        let py_args = PyList::empty(py);
-                                        for (index, val) in params.iter().enumerate() {
-                                            let ty = param_types
-                                                .as_ref()
-                                                .and_then(|types| types.get(index))
-                                                .unwrap_or(&Type::UNKNOWN);
-                                            let decoded = match val {
-                                                None => None,
-                                                Some(bytes) => decode_param(py, &bytes[..], ty),
-                                            };
-                                            match decoded {
-                                                Some(obj) => py_args.append(obj).unwrap(),
-                                                None => py_args.append(py.None()).unwrap(),
-                                            }
-                                        }
-
-                                        kwargs.set_item("query_args", py_args).unwrap();
-                                    }
-
-                                    if let Err(e) = cb.call(py, args, Some(&kwargs)) {
-                                        e.print(py);
-                                    }
-                                });
-                            }
-                        }
-                        WorkerMessage::Connect {
-                            connection_id,
-                            ip,
-                            port,
-                            server_name,
-                            responder,
-                        } => {
-                            let cb_opt = Python::attach(|py| {
-                                connect_cb
-                                    .lock()
-                                    .unwrap()
-                                    .as_ref()
-                                    .map(|cb| cb.clone_ref(py))
-                            });
-                            if let Some(cb) = cb_opt {
-                                Python::attach(|py| {
-                                    let wrapper = Py::new(
-                                        py,
-                                        BoolCallbackWrapper {
-                                            responder: Arc::new(Mutex::new(Some(responder))),
-                                        },
-                                    )
-                                    .unwrap();
-                                    let args = PyTuple::new(
-                                        py,
-                                        [
-                                            connection_id.into_py_any(py).unwrap(),
-                                            ip.clone().into_py_any(py).unwrap(),
-                                            port.into_py_any(py).unwrap(),
-                                        ],
-                                    )
-                                    .unwrap();
-                                    let kwargs = PyDict::new(py);
-                                    kwargs.set_item("callback", wrapper.clone_ref(py)).unwrap();
-                                    if let Some(name) = server_name.clone() {
-                                        let _ = kwargs.set_item("server_name", name);
-                                    } else {
-                                        let _ = kwargs.set_item("server_name", py.None());
-                                    }
-                                    if let Err(e) = cb.call(py, args, Some(&kwargs)) {
-                                        e.print(py);
-                                    }
-                                });
-                            } else {
-                                let _ = responder.send(BoolCallbackResult {
-                                    allowed: true,
-                                    error: None,
-                                });
-                            }
-                        }
-                        WorkerMessage::Disconnect {
-                            connection_id,
-                            ip,
-                            port,
-                        } => {
-                            let cb_opt = Python::attach(|py| {
-                                disconnect_cb
-                                    .lock()
-                                    .unwrap()
-                                    .as_ref()
-                                    .map(|cb| cb.clone_ref(py))
-                            });
-                            if let Some(cb) = cb_opt {
-                                Python::attach(|py| {
-                                    let args = PyTuple::new(
-                                        py,
-                                        [
-                                            connection_id.into_py_any(py).unwrap(),
-                                            ip.clone().into_py_any(py).unwrap(),
-                                            port.into_py_any(py).unwrap(),
-                                        ],
-                                    )
-                                    .unwrap();
-                                    if let Err(e) = cb.call1(py, args) {
-                                        e.print(py);
-                                    }
-                                });
-                            }
-                        }
-                        WorkerMessage::Authentication {
-                            connection_id,
-                            user,
-                            database,
-                            host,
-                            password,
-                            responder,
-                        } => {
-                            let cb_opt = Python::attach(|py| {
-                                auth_cb_thread
-                                    .lock()
-                                    .unwrap()
-                                    .as_ref()
-                                    .map(|cb| cb.clone_ref(py))
-                            });
-                            if let Some(cb) = cb_opt {
-                                Python::attach(|py| {
-                                    let wrapper = Py::new(
-                                        py,
-                                        BoolCallbackWrapper {
-                                            responder: Arc::new(Mutex::new(Some(responder))),
-                                        },
-                                    )
-                                    .unwrap();
-                                    let args = PyTuple::new(
-                                        py,
-                                        [
-                                            connection_id.into_py_any(py).unwrap(),
-                                            user.clone().into_py_any(py).unwrap(),
-                                            password.clone().into_py_any(py).unwrap(),
-                                            host.clone().into_py_any(py).unwrap(),
-                                        ],
-                                    )
-                                    .unwrap();
-                                    let kwargs = PyDict::new(py);
-                                    kwargs.set_item("callback", wrapper.clone_ref(py)).unwrap();
-                                    if let Some(db) = database {
-                                        kwargs.set_item("database", db).unwrap();
-                                    }
-                                    if let Err(e) = cb.call(py, args, Some(&kwargs)) {
-                                        e.print(py);
-                                    }
-                                });
-                            } else {
-                                let _ = responder.send(BoolCallbackResult {
-                                    allowed: true,
-                                    error: None,
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    info!("[PY_WORKER] Channel closed");
-                    break;
-                }
-            }
+            run_python_worker_loop(&rx, &query_cb, &connect_cb, &disconnect_cb, &auth_cb_thread);
         });
 
         PythonWorker {
@@ -1958,10 +2234,10 @@ impl StartupHandler for RiffqProcessor {
     /// connection id, consult the host, admit the connection to its database,
     /// and only then send `ReadyForQuery`: after that the client believes it is
     /// connected and a refusal would arrive too late to stop it.
-    // One arm per startup message the client can send, plus the shared
-    // post-handshake tail. Splitting the arms apart would hide that both of
-    // them must admit the connection before finish_authentication.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// The match below is the one place every startup message riffq answers is
+    /// listed; each arm hands the message to the step of the handshake it
+    /// belongs to.
     async fn on_startup<C>(
         &self,
         client: &mut C,
@@ -1981,142 +2257,24 @@ impl StartupHandler for RiffqProcessor {
         // because `message` is consumed by the match below.
         let is_startup_message = matches!(message, PgWireFrontendMessage::Startup(_));
 
-        match message {
+        let outcome = match message {
             PgWireFrontendMessage::Startup(ref startup) => {
-                pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
-                if self.py_worker.authentication_enabled() {
-                    client.set_state(PgWireConnectionState::AuthenticationInProgress);
-                    client
-                        .send(PgWireBackendMessage::Authentication(
-                            Authentication::CleartextPassword,
-                        ))
-                        .await?;
-                } else {
-                    let id = CONNECTION_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    client
-                        .metadata_mut()
-                        .insert("connection_id".to_string(), id.to_string());
-                    if let Some(sender) = self.conn_id_sender.lock().unwrap().take() {
-                        let _ = sender.send(id);
-                    }
-                    let addr = client.socket_addr();
-                    // Obtain server_name (SNI) via pgwire ClientInfo helper
-                    let allowed = self
-                        .py_worker
-                        .on_connect(
-                            id,
-                            addr.ip().to_string(),
-                            addr.port(),
-                            client.sni_server_name(),
-                        )
-                        .await;
-                    if !allowed.allowed {
-                        let err_info = allowed.error.unwrap_or_else(|| {
-                            Box::new(ErrorInfo::new(
-                                "FATAL".to_string(),
-                                "28000".to_string(),
-                                "Connection rejected".to_string(),
-                            ))
-                        });
-                        let error = ErrorResponse::from(*err_info);
-                        client
-                            .feed(PgWireBackendMessage::ErrorResponse(error))
-                            .await?;
-                        client.close().await?;
-                        return Ok(());
-                    }
-                    // Admit the connection to its database BEFORE the handshake completes.
-                    // finish_authentication sends ReadyForQuery, after which the client
-                    // considers itself connected and a refusal arrives too late to stop it.
-                    self.install_context_for_database(
-                        client
-                            .metadata()
-                            .get(pgwire::api::METADATA_DATABASE)
-                            .cloned(),
-                        client.metadata().get(pgwire::api::METADATA_USER).cloned(),
-                    )
-                    .await?;
-                    finish_authentication(client, &params).await?;
-                }
+                self.begin_startup_handshake(client, startup, &params)
+                    .await?
             }
-            PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
-                let pwd = pwd.into_password()?;
-                let id = CONNECTION_COUNTER.fetch_add(1, Ordering::SeqCst);
-                client
-                    .metadata_mut()
-                    .insert("connection_id".to_string(), id.to_string());
-                if let Some(sender) = self.conn_id_sender.lock().unwrap().take() {
-                    let _ = sender.send(id);
-                }
-
-                let login_info = pgwire::api::auth::LoginInfo::from_client_info(client);
-                let allowed = self
-                    .py_worker
-                    .on_authentication(
-                        id,
-                        login_info.user().map(std::string::ToString::to_string),
-                        login_info.database().map(std::string::ToString::to_string),
-                        login_info.host().to_string(),
-                        pwd.password,
-                    )
-                    .await;
-                if !allowed.allowed {
-                    let err_info = allowed.error.unwrap_or_else(|| {
-                        Box::new(ErrorInfo::new(
-                            "FATAL".to_string(),
-                            "28P01".to_string(),
-                            "Authentication failed".to_string(),
-                        ))
-                    });
-                    let error = ErrorResponse::from(*err_info);
-                    client
-                        .feed(PgWireBackendMessage::ErrorResponse(error))
-                        .await?;
-                    client.close().await?;
-                    return Ok(());
-                }
-
-                let addr = client.socket_addr();
-                let allowed = self
-                    .py_worker
-                    .on_connect(
-                        id,
-                        addr.ip().to_string(),
-                        addr.port(),
-                        client.sni_server_name(),
-                    )
-                    .await;
-                if !allowed.allowed {
-                    let err_info = allowed.error.unwrap_or_else(|| {
-                        Box::new(ErrorInfo::new(
-                            "FATAL".to_string(),
-                            "28000".to_string(),
-                            "Connection rejected".to_string(),
-                        ))
-                    });
-                    let error = ErrorResponse::from(*err_info);
-                    client
-                        .feed(PgWireBackendMessage::ErrorResponse(error))
-                        .await?;
-                    client.close().await?;
-                    return Ok(());
-                }
-
-                // Admit the connection to its database BEFORE the handshake completes.
-                // finish_authentication sends ReadyForQuery, after which the client
-                // considers itself connected and a refusal arrives too late to stop it.
-                self.install_context_for_database(
-                    client
-                        .metadata()
-                        .get(pgwire::api::METADATA_DATABASE)
-                        .cloned(),
-                    client.metadata().get(pgwire::api::METADATA_USER).cloned(),
-                )
-                .await?;
-
-                finish_authentication(client, &params).await?;
+            PgWireFrontendMessage::PasswordMessageFamily(password_message) => {
+                self.finish_password_handshake(client, password_message, &params)
+                    .await?
             }
-            _ => {}
+            // A message riffq does not answer here leaves the client exactly as
+            // it was, still waiting on the handshake it started.
+            _ => StartupHandshakeOutcome::ClientConnected,
+        };
+
+        // A rejected client has already been sent its error and had its socket
+        // closed, so there is nothing left to say to it.
+        if matches!(outcome, StartupHandshakeOutcome::ClientRejected) {
+            return Ok(());
         }
 
         // Nothing below has a context to work with until the connection has been
@@ -2136,6 +2294,203 @@ impl StartupHandler for RiffqProcessor {
 
         Ok(())
     }
+}
+
+/// What a startup message left the client in: still talking to riffq, or told
+/// why it was refused and disconnected.
+///
+/// Carried back to `on_startup` so it knows whether there is still a client to
+/// go on with, instead of every refusal having to return out of the handler
+/// itself.
+enum StartupHandshakeOutcome {
+    ClientConnected,
+    ClientRejected,
+}
+
+impl RiffqProcessor {
+    /// Answer the client's Startup message.
+    ///
+    /// With authentication enabled this only asks for a cleartext password and
+    /// the handshake continues in `finish_password_handshake` once it arrives.
+    /// Otherwise the host is asked whether to admit the client, and the
+    /// handshake is completed here.
+    async fn begin_startup_handshake<C>(
+        &self,
+        client: &mut C,
+        startup: &Startup,
+        params: &DefaultServerParameterProvider,
+    ) -> PgWireResult<StartupHandshakeOutcome>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+        if self.py_worker.authentication_enabled() {
+            client.set_state(PgWireConnectionState::AuthenticationInProgress);
+            client
+                .send(PgWireBackendMessage::Authentication(
+                    Authentication::CleartextPassword,
+                ))
+                .await?;
+            return Ok(StartupHandshakeOutcome::ClientConnected);
+        }
+
+        let id = self.assign_connection_id(client);
+        let addr = client.socket_addr();
+        // Obtain server_name (SNI) via pgwire ClientInfo helper
+        let allowed = self
+            .py_worker
+            .on_connect(
+                id,
+                addr.ip().to_string(),
+                addr.port(),
+                client.sni_server_name(),
+            )
+            .await;
+        if !allowed.allowed {
+            refuse_client(client, allowed.error, "28000", "Connection rejected").await?;
+            return Ok(StartupHandshakeOutcome::ClientRejected);
+        }
+
+        self.admit_connection_and_finish_handshake(client, params)
+            .await?;
+        Ok(StartupHandshakeOutcome::ClientConnected)
+    }
+
+    /// Answer the password the client sent after being asked for one.
+    ///
+    /// The host verifies the password first and is then asked whether to admit
+    /// the client at all, so a server may accept a user's credentials and still
+    /// refuse the connection.
+    async fn finish_password_handshake<C>(
+        &self,
+        client: &mut C,
+        password_message: PasswordMessageFamily,
+        params: &DefaultServerParameterProvider,
+    ) -> PgWireResult<StartupHandshakeOutcome>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let pwd = password_message.into_password()?;
+        let id = self.assign_connection_id(client);
+
+        let login_info = pgwire::api::auth::LoginInfo::from_client_info(client);
+        let allowed = self
+            .py_worker
+            .on_authentication(
+                id,
+                login_info.user().map(std::string::ToString::to_string),
+                login_info.database().map(std::string::ToString::to_string),
+                login_info.host().to_string(),
+                pwd.password,
+            )
+            .await;
+        if !allowed.allowed {
+            refuse_client(client, allowed.error, "28P01", "Authentication failed").await?;
+            return Ok(StartupHandshakeOutcome::ClientRejected);
+        }
+
+        let addr = client.socket_addr();
+        let allowed = self
+            .py_worker
+            .on_connect(
+                id,
+                addr.ip().to_string(),
+                addr.port(),
+                client.sni_server_name(),
+            )
+            .await;
+        if !allowed.allowed {
+            refuse_client(client, allowed.error, "28000", "Connection rejected").await?;
+            return Ok(StartupHandshakeOutcome::ClientRejected);
+        }
+
+        self.admit_connection_and_finish_handshake(client, params)
+            .await?;
+        Ok(StartupHandshakeOutcome::ClientConnected)
+    }
+
+    /// Take the next connection id, record it in the client's metadata, and
+    /// hand it to whoever asked to be told the id of the next connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `conn_id_sender` lock is poisoned, which means a previous
+    /// caller panicked while holding it.
+    fn assign_connection_id<C>(&self, client: &mut C) -> u64
+    where
+        C: ClientInfo,
+    {
+        let id = CONNECTION_COUNTER.fetch_add(1, Ordering::SeqCst);
+        client
+            .metadata_mut()
+            .insert("connection_id".to_string(), id.to_string());
+        if let Some(sender) = self.conn_id_sender.lock().unwrap().take() {
+            let _ = sender.send(id);
+        }
+        id
+    }
+
+    /// Give the connection its database context and complete the handshake.
+    ///
+    /// The context is installed first on purpose: `finish_authentication` sends
+    /// `ReadyForQuery`, after which the client considers itself connected and a
+    /// refusal arrives too late to stop it.
+    async fn admit_connection_and_finish_handshake<C>(
+        &self,
+        client: &mut C,
+        params: &DefaultServerParameterProvider,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.install_context_for_database(
+            client
+                .metadata()
+                .get(pgwire::api::METADATA_DATABASE)
+                .cloned(),
+            client.metadata().get(pgwire::api::METADATA_USER).cloned(),
+        )
+        .await?;
+        finish_authentication(client, params).await
+    }
+}
+
+/// Tell the client why it is not being let in, and close the connection.
+///
+/// `host_error` is the error the host supplied with its refusal; a host that
+/// refused without wording it gets the generic FATAL error built from
+/// `sqlstate` and `description` instead, so a refused client always learns
+/// something rather than watching the socket drop.
+async fn refuse_client<C>(
+    client: &mut C,
+    host_error: Option<Box<ErrorInfo>>,
+    sqlstate: &str,
+    description: &str,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: std::fmt::Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let err_info = host_error.unwrap_or_else(|| {
+        Box::new(ErrorInfo::new(
+            "FATAL".to_string(),
+            sqlstate.to_string(),
+            description.to_string(),
+        ))
+    });
+    let error = ErrorResponse::from(*err_info);
+    client
+        .feed(PgWireBackendMessage::ErrorResponse(error))
+        .await?;
+    client.close().await?;
+    Ok(())
 }
 
 impl RiffqProcessor {
@@ -2628,10 +2983,8 @@ fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
     let cert = certs(&mut BufReader::new(File::open(cert_path)?))
         .collect::<Result<Vec<CertificateDer>, IOError>>()?;
 
-    // private_key() understands PKCS#8, PKCS#1 and SEC1 PEM. The previous
-    // pkcs8-only parse produced an empty Vec for e.g. "BEGIN RSA PRIVATE KEY"
-    // files, and the .remove(0) panicked -- which, through pyo3, killed the
-    // calling thread instead of raising a catchable error.
+    // private_key() understands PKCS#8, PKCS#1 and SEC1 PEM, so a "BEGIN RSA
+    // PRIVATE KEY" file parses along with the other two forms.
     let key: PrivateKeyDer =
         private_key(&mut BufReader::new(File::open(key_path)?))?.ok_or_else(|| {
             IOError::new(
@@ -3379,11 +3732,11 @@ async fn accept_connections(
 
         tokio::spawn(async move {
             // detect_gssencmode waits for the client's first bytes, so it must
-            // run inside the per-connection task. When it was awaited inline in
-            // the accept loop, a single client that connected and never sent
-            // anything blocked ALL accepts: the kernel kept completing
-            // handshakes into the listen backlog, but no connection was ever
-            // served.
+            // run inside the per-connection task rather than the accept loop:
+            // awaiting it there would let one client that connects and sends
+            // nothing block every accept, since the kernel keeps completing
+            // handshakes into the listen backlog while this task waits on just
+            // the one connection.
             let Some(socket) = detect_gssencmode(socket).await else {
                 return;
             };
@@ -3515,9 +3868,9 @@ fn _riffq(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     //! Regression tests for the value-encoding paths.
     //!
-    //! Every case here used to panic inside the row-encoding task, which aborts
-    //! the client's connection rather than returning an error, and none of them
-    //! was covered by the Python suites or the driver tiers.
+    //! A panic in any of these would abort the client's connection rather than
+    //! return an error, so the edge cases below are exercised directly instead
+    //! of relying on the Python suites or the driver tiers to hit them.
 
     use super::{
         arrow_value_to_string, decimal_fraction_digits, format_decimal_i128,
@@ -3550,7 +3903,7 @@ mod tests {
         assert_eq!(moment.timestamp_subsec_nanos(), 999_999_999);
     }
 
-    /// The epoch itself, to pin that the fix did not shift ordinary values.
+    /// The epoch itself, to confirm an ordinary instant is not shifted.
     #[test]
     fn timestamp_at_the_epoch_converts() {
         let moment = timestamp_nanos_to_datetime(0).expect("the epoch");
@@ -3567,7 +3920,8 @@ mod tests {
     /// A pre-epoch timestamp column renders through the real encoder path.
     ///
     /// `timestamp_nanos_to_datetime` is only correct if `arrow_value_to_string`
-    /// actually routes through it, which is where the panic used to happen.
+    /// actually routes through it, so this exercises the encoder path itself
+    /// rather than testing the conversion function in isolation.
     #[test]
     fn pre_epoch_timestamp_column_renders() {
         let column = TimestampNanosecondArray::from(vec![-14_182_940i64 * 1_000_000_000]);
