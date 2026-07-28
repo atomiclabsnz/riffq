@@ -53,6 +53,7 @@ def stable_oid(salt: str, *parts: str) -> int:
             accumulator = (accumulator * 33 + ord(character)) & 0x7FFFFFFF
     return FIRST_USER_OID + (accumulator % 2_000_000_000)
 
+
 _type = {
     "int": pa.int64(),
     "float": pa.float64(),
@@ -64,7 +65,7 @@ _type = {
 }
 
 
-def to_arrow(schema_desc:list[dict], rows:list) -> 'pa._ffi.lib.PyCapsule':
+def to_arrow(schema_desc: list[dict], rows: list) -> 'pa._ffi.lib.PyCapsule':
     """Build an Arrow C Stream from schema and rows for regular python values
 
     The schema is a list of dicts like `{ "name": str, "type": str }` where
@@ -74,7 +75,7 @@ def to_arrow(schema_desc:list[dict], rows:list) -> 'pa._ffi.lib.PyCapsule':
 
     Example usage:
     >>> callback(to_arrow([{"name": "val", "type": "int"}], [
-        [1], 
+        [1],
         [2]
     ]))
 

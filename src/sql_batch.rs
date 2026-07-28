@@ -1,6 +1,6 @@
 //! Split a simple-query batch into its individual statements.
 //!
-//! The PostgreSQL simple query protocol lets one Query message carry several
+//! The `PostgreSQL` simple query protocol lets one Query message carry several
 //! statements separated by semicolons, and the server is expected to run each
 //! in turn. Clients that build their SQL themselves rely on this: Npgsql sends
 //! `SELECT version();` followed by its type-loading queries as a single message
@@ -157,9 +157,9 @@ fn skip_line_comment(bytes: &[u8], index: usize) -> usize {
     position
 }
 
-/// Return the index just past a block comment, honouring PostgreSQL nesting.
+/// Return the index just past a block comment, honouring `PostgreSQL` nesting.
 ///
-/// PostgreSQL nests `/* */`, so an inner comment does not end the outer one.
+/// `PostgreSQL` nests `/* */`, so an inner comment does not end the outer one.
 fn skip_block_comment(bytes: &[u8], index: usize) -> usize {
     let mut position = index + 2;
     let mut depth = 1;
@@ -180,15 +180,22 @@ fn skip_block_comment(bytes: &[u8], index: usize) -> usize {
     bytes.len()
 }
 
+/// Tests for the lexical batch splitter.
+///
+/// The cases are grouped by the lexical state a semicolon can hide in, because
+/// each of those states is a separate way for a batch to be split in the wrong
+/// place and hand the database a fragment of a statement.
 #[cfg(test)]
 mod tests {
     use super::split_statements;
 
+    /// A batch with no separator comes back as the one statement it contains.
     #[test]
     fn single_statement_is_returned_whole() {
         assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
     }
 
+    /// A bare semicolon between two statements separates them.
     #[test]
     fn statements_are_split_on_semicolons() {
         assert_eq!(
@@ -197,6 +204,10 @@ mod tests {
         );
     }
 
+    /// The driver batch that motivates this module splits into both statements.
+    ///
+    /// Npgsql sends this on connect, so reading only the first statement makes
+    /// the connection fail outright rather than degrade.
     #[test]
     fn npgsql_startup_batch_splits_into_its_statements() {
         // The shape that made Npgsql unable to connect: a version probe
@@ -211,11 +222,16 @@ mod tests {
         );
     }
 
+    /// A batch that ends in a semicolon does not gain a blank trailing entry.
+    ///
+    /// An empty statement would be executed and reported like any other, so the
+    /// client would see one more command-complete response than it sent.
     #[test]
     fn trailing_semicolon_yields_no_empty_statement() {
         assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
     }
 
+    /// Input that carries no statement text at all produces no statements.
     #[test]
     fn blank_and_semicolon_only_input_yields_nothing() {
         assert!(split_statements("").is_empty());
@@ -224,6 +240,7 @@ mod tests {
         assert!(split_statements("; ; ").is_empty());
     }
 
+    /// Whitespace and newlines around a statement are stripped from the slice.
     #[test]
     fn statements_are_trimmed() {
         assert_eq!(
@@ -232,6 +249,7 @@ mod tests {
         );
     }
 
+    /// A semicolon inside a single-quoted literal is data, not a separator.
     #[test]
     fn semicolon_inside_a_string_does_not_split() {
         assert_eq!(
@@ -240,6 +258,10 @@ mod tests {
         );
     }
 
+    /// A doubled quote is an escaped quote, so the literal continues past it.
+    ///
+    /// Ending the literal at the first of the pair would leave the rest of the
+    /// text outside any quoting, where its semicolon would split the batch.
     #[test]
     fn doubled_quote_inside_a_string_does_not_end_it() {
         assert_eq!(
@@ -248,6 +270,7 @@ mod tests {
         );
     }
 
+    /// In an `E'...'` string a backslash escapes the quote that follows it.
     #[test]
     fn backslash_escape_in_an_escape_string_does_not_end_it() {
         assert_eq!(
@@ -256,6 +279,10 @@ mod tests {
         );
     }
 
+    /// A backslash in a plain string is an ordinary character, not an escape.
+    ///
+    /// The counterpart to the `E'...'` case: treating it as an escape here would
+    /// swallow the closing quote and run the literal on into the next statement.
     #[test]
     fn backslash_is_literal_in_a_regular_string() {
         // Without standard_conforming_strings off, a backslash does not escape
@@ -266,6 +293,10 @@ mod tests {
         );
     }
 
+    /// A word merely ending in `e` before a quote is not an escape string.
+    ///
+    /// `date'...'` is a typed literal; reading it as `E'...'` would turn any
+    /// backslash inside it into an escape and change where the literal ends.
     #[test]
     fn identifier_ending_in_e_does_not_start_an_escape_string() {
         // "table'" must not be read as an E-string just because the preceding
@@ -276,6 +307,7 @@ mod tests {
         );
     }
 
+    /// A semicolon inside a double-quoted identifier is part of the name.
     #[test]
     fn semicolon_inside_a_quoted_identifier_does_not_split() {
         assert_eq!(
@@ -284,6 +316,10 @@ mod tests {
         );
     }
 
+    /// A semicolon in a `--` comment is ignored until the line ends.
+    ///
+    /// The comment stays attached to the statement it trails, so the separator
+    /// is the semicolon on the next line.
     #[test]
     fn semicolon_inside_a_line_comment_does_not_split() {
         assert_eq!(
@@ -292,6 +328,7 @@ mod tests {
         );
     }
 
+    /// A semicolon inside `/* */` is ignored until the comment closes.
     #[test]
     fn semicolon_inside_a_block_comment_does_not_split() {
         assert_eq!(
@@ -300,6 +337,10 @@ mod tests {
         );
     }
 
+    /// An inner `*/` closes only the inner comment, matching `PostgreSQL`.
+    ///
+    /// Stopping at the first `*/` would leave the outer comment's tail as bare
+    /// SQL and let a semicolon inside it split the batch.
     #[test]
     fn nested_block_comments_end_at_the_outer_close() {
         assert_eq!(
@@ -308,6 +349,7 @@ mod tests {
         );
     }
 
+    /// A semicolon inside an untagged `$$...$$` body is part of the body.
     #[test]
     fn semicolon_inside_a_dollar_quoted_body_does_not_split() {
         assert_eq!(
@@ -316,6 +358,8 @@ mod tests {
         );
     }
 
+    /// A tagged `$tag$...$tag$` body runs to the matching tag, semicolons
+    /// included.
     #[test]
     fn tagged_dollar_quoting_does_not_split() {
         assert_eq!(
@@ -324,6 +368,7 @@ mod tests {
         );
     }
 
+    /// A `$1` placeholder is not read as the opening of a dollar-quoted body.
     #[test]
     fn parameter_placeholders_are_not_dollar_quotes() {
         // `$1` must stay a placeholder, or everything after it would be read as
@@ -334,6 +379,7 @@ mod tests {
         );
     }
 
+    /// An unclosed literal keeps the remainder of the batch in one statement.
     #[test]
     fn unterminated_string_consumes_the_rest() {
         // Malformed either way; keeping it whole lets the database report a
@@ -344,6 +390,7 @@ mod tests {
         );
     }
 
+    /// Every statement in a longer batch is returned, not just the first pair.
     #[test]
     fn many_statements_all_split() {
         assert_eq!(

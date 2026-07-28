@@ -5,7 +5,6 @@ import unittest
 from helpers import stop_server
 import psycopg
 
-import pyarrow as pa
 
 def _run_server_catalog(port: int, enabled: bool):
     import riffq
@@ -54,6 +53,7 @@ def _run_server_catalog(port: int, enabled: bool):
         server.register_database("db")
     server.on_query(handle_query)
     server.start(catalog_emulation=enabled)
+
 
 class PgCatalogEnabledTest(unittest.TestCase):
     @classmethod
@@ -135,6 +135,7 @@ class PgCatalogDisabledTest(unittest.TestCase):
             row = cur.fetchone()
             self.assertEqual(row[0], 1)
         conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

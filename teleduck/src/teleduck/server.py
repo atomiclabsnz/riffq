@@ -2,13 +2,13 @@ import atexit
 import duckdb
 import pyarrow as pa
 import riffq
-from riffq.helpers import stable_oid, to_arrow
+from riffq.helpers import stable_oid
 import logging
-import threading
 from pathlib import Path
 from typing import Iterable, Optional
 import os
 import hashlib
+
 
 def map_type(data_type: str) -> str:
     dt = data_type.upper()
@@ -184,13 +184,13 @@ class Connection(riffq.BaseConnection):
 
         if sql.lower().startswith("begin"):
             return callback("BEGIN", is_tag=True)
-        
+
         if sql.lower().startswith("commit"):
             return callback("COMMIT", is_tag=True)
-        
+
         if sql.lower().startswith("rollback"):
             return callback("ROLLBACK", is_tag=True)
-        
+
         if sql.lower().startswith("discard all"):
             return callback("DISCARD ALL", is_tag=True)
 
@@ -221,7 +221,7 @@ class Connection(riffq.BaseConnection):
                 ["transaction_isolation"],
             )
             return self.send_reader(batch, callback)
-        
+
         if sql == "select current_schema()":
             batch = self.arrow_batch(
                 [pa.array(["main"])],
@@ -270,6 +270,7 @@ class Connection(riffq.BaseConnection):
             ok = ok and hashed == env_password_sha1
 
         callback(ok)
+
 
 def run_server(
     db_file: str,
@@ -352,7 +353,6 @@ def run_server(
     if use_tls:
         server.set_tls(cert_path, key_path)
 
-
     # Drive pg_catalog lazily from the live DuckDB connection: every catalog
     # scan re-reads DuckDB's schema, so tables created after startup show up
     # without any re-registration. (Replaces the previous eager walk that
@@ -366,7 +366,8 @@ def run_server(
     server.handle_shutdown(_checkpoint_and_close)
 
     server.start(catalog_emulation=True, tls=use_tls)
-    
+
+
 if __name__ == "__main__":
     import click
 
@@ -376,8 +377,28 @@ if __name__ == "__main__":
     @click.option("--use-tls/--no-use-tls", "use_tls", default=True, show_default=True, help="Use TLS for the server")
     @click.option("--tls-cert-file", default=None, type=click.Path(), help="Path to TLS certificate")
     @click.option("--tls-key-file", default=None, type=click.Path(), help="Path to TLS key")
-    @click.option("--read-only/--no-read-only", "read_only", default=False, show_default=True, help="Open database in read-only mode")
-    def _main(db_file: str, port: int, use_tls: bool, tls_cert_file: str | None, tls_key_file: str | None, read_only: bool):
-        run_server(db_file, port, use_tls=use_tls, tls_cert_file=tls_cert_file, tls_key_file=tls_key_file, read_only=read_only)
+    @click.option(
+        "--read-only/--no-read-only",
+        "read_only",
+        default=False,
+        show_default=True,
+        help="Open database in read-only mode",
+    )
+    def _main(
+        db_file: str,
+        port: int,
+        use_tls: bool,
+        tls_cert_file: str | None,
+        tls_key_file: str | None,
+        read_only: bool,
+    ):
+        run_server(
+            db_file,
+            port,
+            use_tls=use_tls,
+            tls_cert_file=tls_cert_file,
+            tls_key_file=tls_key_file,
+            read_only=read_only,
+        )
 
     _main()

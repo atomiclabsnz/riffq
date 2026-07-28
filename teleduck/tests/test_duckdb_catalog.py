@@ -30,9 +30,9 @@ class DuckDbCatalogTest(unittest.TestCase):
             con.execute("CREATE TABLE users(id INTEGER, name VARCHAR)")
             con.execute("CREATE TABLE projects(id INTEGER, name VARCHAR)")
             con.execute("CREATE TABLE tasks(id INTEGER, project_id INTEGER, description VARCHAR)")
-            
+
             cls.database_name = con.execute(
-            "SELECT database_name, path, type FROM duckdb_databases() where internal=false"
+                "SELECT database_name, path, type FROM duckdb_databases() where internal=false"
             ).fetchall()[0][0]
 
         cls.proc = multiprocessing.Process(

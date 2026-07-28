@@ -4,7 +4,6 @@ import time
 import psycopg
 import unittest
 from helpers import stop_server
-import pyarrow as pa
 
 
 def _run_server(port: int):
