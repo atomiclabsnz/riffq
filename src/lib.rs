@@ -48,8 +48,9 @@ use arrow::record_batch::RecordBatchReader;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::context::SessionContext;
 use datafusion_pg_catalog::{
-    ColumnDef, ColumnSpec, ConfigSettingDef, DatabaseDef, LazyCatalogOptions, LazyCatalogSource,
-    RelationDef, RelationKind, SchemaDef, SettingDef, dispatch_query, get_base_session_context,
+    ColumnDef, ColumnSpec, ConfigSettingDef, ConstraintDef, DatabaseDef, ForeignKeyAction,
+    IndexDef, LazyCatalogOptions, LazyCatalogSource, RelationDef, RelationKind, SchemaDef,
+    SettingDef, dispatch_query, get_base_session_context,
     get_base_session_context_with_lazy_catalog, register_schema, register_user_database,
     register_user_tables,
 };
@@ -1780,13 +1781,20 @@ impl ExtendedQueryHandler for RiffqProcessor {
             )
         );
 
-        let query = query.trim().to_lowercase();
+        // Match on a lowercased copy, but execute the original text. Shadowing
+        // `query` with the lowercased statement corrupted every string literal
+        // in it -- `WHERE constraint_type = 'PRIMARY KEY'` was sent on as
+        // `'primary key'` and matched nothing, and `'ABC' = 'abc'` compared
+        // equal. The simple-query path above already keeps the two separate;
+        // this path did not.
+        let trimmed = query.trim();
+        let query_lc = trimmed.to_lowercase();
 
-        if query.is_empty() {
+        if query_lc.is_empty() {
             return Ok(Response::Execution(Tag::new("")));
-        } else if query.starts_with("discard all") {
+        } else if query_lc.starts_with("discard all") {
             return Ok(Response::Execution(Tag::new("DISCARD ALL")));
-        } else if query == "show transaction isolation level" {
+        } else if query_lc == "show transaction isolation level" {
             let field_infos = Arc::new(vec![FieldInfo::new(
                 "transaction_isolation".to_string(),
                 None,
@@ -1800,7 +1808,7 @@ impl ExtendedQueryHandler for RiffqProcessor {
             let row = encoder.take_row();
             let rows = stream::iter(vec![Ok(row)]);
             return Ok(Response::Query(QueryResponse::new(field_infos, rows)));
-        } else if let Some(var) = Self::parse_show_variable(query.as_str()) {
+        } else if let Some(var) = Self::parse_show_variable(query_lc.as_str()) {
             if let Some(resp) = self.show_variable_response(
                 &var.to_lowercase(),
                 portal.result_column_format.format_for(0),
@@ -1820,7 +1828,7 @@ impl ExtendedQueryHandler for RiffqProcessor {
         let result = self
             .query_runner
             .execute(
-                query.to_string(),
+                trimmed.to_string(),
                 Some(portal.parameters.clone()),
                 Some(resolve_param_types(&portal.statement.parameter_types)),
                 false,
@@ -2041,6 +2049,63 @@ fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// PostgreSQL's own `information_schema.referential_constraints` resolves
+/// `unique_constraint_name` by walking `pg_depend` (foreign key -> the unique
+/// index it depends on -> the constraint that owns that index). The emulated
+/// catalog has no `pg_depend`, so that column comes back NULL and every client
+/// that INNER JOINs on it -- Power BI's relationship discovery does exactly
+/// that -- silently sees no foreign keys at all.
+///
+/// The same fact is derivable without `pg_depend`: the referenced key is the
+/// primary/unique constraint on `confrelid` whose `conkey` matches the foreign
+/// key's `confkey`. This view is installed over the registered one after the
+/// session context is built.
+const REFERENTIAL_CONSTRAINTS_VIEW: &str = r#"
+CREATE OR REPLACE VIEW information_schema.referential_constraints AS
+SELECT '{catalog}'      AS constraint_catalog,
+       ncon.nspname       AS constraint_schema,
+       con.conname        AS constraint_name,
+       CASE WHEN npkc.nspname IS NULL THEN NULL ELSE '{catalog}' END
+                          AS unique_constraint_catalog,
+       npkc.nspname       AS unique_constraint_schema,
+       pkc.conname        AS unique_constraint_name,
+       CASE con.confmatchtype WHEN 'f' THEN 'FULL' WHEN 'p' THEN 'PARTIAL'
+                              WHEN 's' THEN 'NONE' ELSE NULL END AS match_option,
+       CASE con.confupdtype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
+                            WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT'
+                            WHEN 'a' THEN 'NO ACTION' ELSE NULL END AS update_rule,
+       CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
+                            WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT'
+                            WHEN 'a' THEN 'NO ACTION' ELSE NULL END AS delete_rule
+FROM pg_catalog.pg_namespace ncon
+JOIN pg_catalog.pg_constraint con ON ncon.oid = con.connamespace
+JOIN pg_catalog.pg_class c ON con.conrelid = c.oid AND con.contype = 'f'
+LEFT JOIN pg_catalog.pg_constraint pkc
+       ON pkc.conrelid = con.confrelid
+      AND pkc.contype IN ('p', 'u')
+      AND pkc.conkey = con.confkey
+LEFT JOIN pg_catalog.pg_namespace npkc ON pkc.connamespace = npkc.oid
+"#;
+
+/// Install [`REFERENTIAL_CONSTRAINTS_VIEW`] over the registered view. Logged and
+/// ignored on failure: a server that cannot replace the view is still usable,
+/// just without foreign keys visible to clients that join on
+/// `unique_constraint_name`.
+///
+/// `catalog` is substituted for the catalog-name columns rather than calling
+/// `current_database()`: that function is resolved per client query, so it is
+/// not available while planning a `CREATE VIEW` body at startup.
+async fn install_referential_constraints_view(ctx: &SessionContext, catalog: &str) {
+    let sql = REFERENTIAL_CONSTRAINTS_VIEW.replace("{catalog}", catalog);
+    match ctx.sql(&sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(_) => log::info!("installed pg_depend-free referential_constraints view"),
+            Err(e) => log::warn!("could not install referential_constraints view: {e}"),
+        },
+        Err(e) => log::warn!("could not plan referential_constraints view: {e}"),
+    }
+}
+
 /// Convert a Python exception raised by a lazy catalog source into a
 /// `DataFusionError`, so the failure propagates to the SQL client instead of
 /// being swallowed (the lazy catalog contract forbids failing silently).
@@ -2118,6 +2183,16 @@ fn opt_bool_or(d: &Bound<'_, PyDict>, key: &str, default: bool) -> DFResult<bool
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) if !v.is_none() => v.extract::<bool>().map_err(py_to_df),
         _ => Ok(default),
+    }
+}
+
+/// Read a required list-of-integers field from a row dict (e.g. key attnums).
+fn req_i32_list(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Vec<i32>> {
+    match d.get_item(key).map_err(py_to_df)? {
+        Some(v) => v.extract::<Vec<i32>>().map_err(py_to_df),
+        None => Err(DataFusionError::Execution(format!(
+            "lazy catalog row is missing required field '{key}'"
+        ))),
     }
 }
 
@@ -2203,6 +2278,96 @@ fn parse_columns(list: &Bound<'_, PyAny>) -> DFResult<Vec<ColumnSpec>> {
                 req_i32(d, "type_oid")?,
                 req_bool(d, "nullable")?,
             ))
+        })
+        .collect()
+}
+
+/// Parse `indexes()` rows:
+/// `{index_oid, index_name, table_oid, key_attnums, [is_unique], [is_primary]}`
+/// -> [`IndexDef`].
+fn parse_indexes(list: &Bound<'_, PyAny>) -> DFResult<Vec<IndexDef>> {
+    row_dicts("indexes", list)?
+        .iter()
+        .map(|d| {
+            Ok(IndexDef {
+                index_oid: req_i32(d, "index_oid")?,
+                index_name: req_str(d, "index_name")?,
+                table_oid: req_i32(d, "table_oid")?,
+                key_attnums: req_i32_list(d, "key_attnums")?,
+                is_unique: opt_bool_or(d, "is_unique", false)?,
+                is_primary: opt_bool_or(d, "is_primary", false)?,
+            })
+        })
+        .collect()
+}
+
+/// Read a foreign key referential action, accepting either the spelled-out name
+/// or the single-character `pg_constraint` code. Absent means `NO ACTION`.
+fn fk_action(d: &Bound<'_, PyDict>, key: &str) -> DFResult<ForeignKeyAction> {
+    Ok(match opt_str(d, key)?.as_deref() {
+        None | Some("no_action") | Some("a") => ForeignKeyAction::NoAction,
+        Some("restrict") | Some("r") => ForeignKeyAction::Restrict,
+        Some("cascade") | Some("c") => ForeignKeyAction::Cascade,
+        Some("set_null") | Some("n") => ForeignKeyAction::SetNull,
+        Some("set_default") | Some("d") => ForeignKeyAction::SetDefault,
+        Some(other) => {
+            return Err(DataFusionError::Execution(format!(
+                "unknown foreign key action '{other}' for '{key}'                  (use no_action/restrict/cascade/set_null/set_default)"
+            )));
+        }
+    })
+}
+
+/// Parse `constraints()` rows:
+/// `{oid, name, kind, namespace_oid, table_oid, key_attnums, [index_oid],
+///   [referenced_table_oid], [referenced_key_attnums], [on_update], [on_delete]}`
+/// -> [`ConstraintDef`].
+fn parse_constraints(list: &Bound<'_, PyAny>) -> DFResult<Vec<ConstraintDef>> {
+    row_dicts("constraints", list)?
+        .iter()
+        .map(|d| {
+            let oid = req_i32(d, "oid")?;
+            let name = req_str(d, "name")?;
+            let namespace_oid = req_i32(d, "namespace_oid")?;
+            let table_oid = req_i32(d, "table_oid")?;
+            let key_attnums = req_i32_list(d, "key_attnums")?;
+            let index_oid = opt_i32(d, "index_oid")?.unwrap_or(0);
+            match opt_str(d, "kind")?.as_deref() {
+                Some("primary_key") | Some("p") | None => Ok(ConstraintDef::primary_key(
+                    oid,
+                    name,
+                    namespace_oid,
+                    table_oid,
+                    key_attnums,
+                    index_oid,
+                )),
+                Some("unique") | Some("u") => Ok(ConstraintDef::unique(
+                    oid,
+                    name,
+                    namespace_oid,
+                    table_oid,
+                    key_attnums,
+                    index_oid,
+                )),
+                Some("foreign_key") | Some("f") => {
+                    let mut def = ConstraintDef::foreign_key(
+                        oid,
+                        name,
+                        namespace_oid,
+                        table_oid,
+                        key_attnums,
+                        req_i32(d, "referenced_table_oid")?,
+                        req_i32_list(d, "referenced_key_attnums")?,
+                        index_oid,
+                    )?;
+                    def.on_update = fk_action(d, "on_update")?;
+                    def.on_delete = fk_action(d, "on_delete")?;
+                    Ok(def)
+                }
+                Some(other) => Err(DataFusionError::Execution(format!(
+                    "unknown constraint kind '{other}'                      (use primary_key/unique/foreign_key)"
+                ))),
+            }
         })
         .collect()
 }
@@ -2317,6 +2482,46 @@ impl LazyCatalogSource for PyLazyCatalogSource {
         let defs = Python::attach(|py| -> DFResult<Vec<ColumnSpec>> {
             match self.pull(py, "columns", &[database, schema, relation])? {
                 Some(list) => parse_columns(list.bind(py)),
+                None => Ok(Vec::new()),
+            }
+        })?;
+        callback(defs);
+        Ok(())
+    }
+
+    fn indexes(
+        &self,
+        database: &str,
+        schema: &str,
+        callback: &mut dyn FnMut(Vec<IndexDef>),
+    ) -> DFResult<()> {
+        let defs = Python::attach(|py| -> DFResult<Vec<IndexDef>> {
+            // Optional method: a source without `indexes` exposes none.
+            if !self.obj.bind(py).hasattr("indexes").map_err(py_to_df)? {
+                return Ok(Vec::new());
+            }
+            match self.pull(py, "indexes", &[database, schema])? {
+                Some(list) => parse_indexes(list.bind(py)),
+                None => Ok(Vec::new()),
+            }
+        })?;
+        callback(defs);
+        Ok(())
+    }
+
+    fn constraints(
+        &self,
+        database: &str,
+        schema: &str,
+        callback: &mut dyn FnMut(Vec<ConstraintDef>),
+    ) -> DFResult<()> {
+        let defs = Python::attach(|py| -> DFResult<Vec<ConstraintDef>> {
+            // Optional method: a source without `constraints` exposes none.
+            if !self.obj.bind(py).hasattr("constraints").map_err(py_to_df)? {
+                return Ok(Vec::new());
+            }
+            match self.pull(py, "constraints", &[database, schema])? {
+                Some(list) => parse_constraints(list.bind(py)),
                 None => Ok(Vec::new()),
             }
         })?;
@@ -2556,6 +2761,7 @@ impl Server {
                 )
                 .await
                 .unwrap();
+                install_referential_constraints_view(&raw_ctx, "datafusion").await;
                 ctx_map.insert("datafusion".to_string(), Arc::new(raw_ctx));
             } else if self.databases.is_empty() {
                 if catalog_emulation {
