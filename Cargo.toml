@@ -2,10 +2,32 @@
 name = "riffq"
 version = "0.1.11"
 edition = "2024"
+# `rust-consumer/` is its own crate rather than a cargo example, for two
+# reasons: an example inherits this crate's features, and with `python` on it
+# would link against an interpreter a standalone binary does not have -- and
+# `examples/` is gitignored here, so an example would not be in the repository
+# at all.
+exclude = ["rust-consumer"]
 
 [lib]
 name = "_riffq"
-crate-type = ["cdylib"]
+# cdylib for the Python extension module, rlib so a Rust consumer can link the
+# crate. Both, because the wheel and a Rust binary are two builds of one
+# library rather than two libraries.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+# The Python surface: the `_riffq` extension module, the `Server` pyclass, and
+# the worker that marshals callbacks into an interpreter. On by default, so
+# `maturin build` and every existing consumer are unchanged.
+#
+# Off, the crate is the protocol core alone -- pgwire, the DataFusion catalog
+# and the Arrow encoding -- with `QueryRunner` and `SessionHooks` left for the
+# consumer to implement. That build links no interpreter, which is the whole
+# point: pyo3's `extension-module` leaves Python's symbols undefined for the
+# host process to provide, and a Rust binary is not one.
+python = ["dep:pyo3"]
 
 [profile.fast]
 inherits = "dev"
@@ -16,7 +38,7 @@ incremental = true
 codegen-units = 4
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 
 pgwire = "0.40.0"
 # pgwire = { git = "https://github.com/ybrs/pgwire", branch = "expose-sni", package = "pgwire" }
