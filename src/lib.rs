@@ -2757,8 +2757,25 @@ pub async fn serve(
                         {
                             error!("process_socket error: {:?}", e);
                         }
-                        let connection_id = id_rx.await.unwrap_or(0);
-                        hooks_clone.on_disconnect(connection_id, ip, port).await;
+                        // No fallback id, because there is no spare one to
+                        // fall back to: CONNECTION_COUNTER starts at 0 and
+                        // fetch_add returns the previous value, so **0 is a
+                        // real connection's id** -- the first one served. A
+                        // client that goes before the startup packet never had
+                        // an id assigned, and reporting that as a disconnect of
+                        // connection 0 closes a session that is still open.
+                        // Counted gauges go negative from here, and a consumer
+                        // keying sessions by id loses the wrong one.
+                        match id_rx.await {
+                            Ok(connection_id) => {
+                                hooks_clone.on_disconnect(connection_id, ip, port).await;
+                            }
+                            Err(_) => debug!(
+                                "connection from {}:{} ended before it was assigned an id; \
+                                 no disconnect to report",
+                                ip, port
+                            ),
+                        }
                     });
                 }
             }
