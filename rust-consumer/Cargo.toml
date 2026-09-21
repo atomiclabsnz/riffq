@@ -1,0 +1,15 @@
+[package]
+name = "rust-consumer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# No default features, so no pyo3 and no interpreter. That is the assertion.
+riffq = { path = "..", default-features = false }
+
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+datafusion = "54.0.0"
+pgwire = "0.40.0"
+bytes = "1.5"

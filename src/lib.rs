@@ -3,8 +3,11 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_pg_catalog::session::ClientOpts;
 use futures::{Sink, SinkExt, Stream};
 use log::{debug, error, info};
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::{PyCapsule, PyDict, PyList, PyTuple};
+#[cfg(feature = "python")]
 use pyo3::{Bound, IntoPyObjectExt, PyAny};
 use rustls_pemfile::{certs, private_key};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -87,6 +90,7 @@ use sqlparser::parser::Parser;
 /// PostgreSQL version reported to clients during startup and via `SHOW server_version`.
 pub const SERVER_VERSION: &str = "17.4.0";
 
+#[cfg(feature = "python")]
 pub enum WorkerMessage {
     Query {
         query: String,
@@ -123,16 +127,52 @@ pub struct BoolCallbackResult {
     pub error: Option<Box<ErrorInfo>>,
 }
 
+/// What a connection's lifecycle is reported to: accepted, authenticated, gone.
+///
+/// `RiffqProcessor` held an `Arc<PythonWorker>` and called these on it
+/// directly, which made the protocol core depend on the interpreter for
+/// reasons that have nothing to do with the protocol. A trait here is what
+/// lets the same core serve a Python consumer and a Rust one -- and it is the
+/// seam G3 (#41) assumed already existed.
+#[async_trait]
+pub trait SessionHooks: Send + Sync {
+    async fn on_connect(
+        &self,
+        connection_id: u64,
+        ip: String,
+        port: u16,
+        server_name: Option<&str>,
+    ) -> BoolCallbackResult;
+
+    /// Whether to ask at all. A server with nobody to ask must not send an
+    /// authentication request it will never answer.
+    fn authentication_enabled(&self) -> bool;
+
+    async fn on_authentication(
+        &self,
+        connection_id: u64,
+        user: Option<String>,
+        database: Option<String>,
+        host: String,
+        password: String,
+    ) -> BoolCallbackResult;
+
+    async fn on_disconnect(&self, connection_id: u64, ip: String, port: u16);
+}
+
+#[cfg(feature = "python")]
 #[pyclass]
 struct CallbackWrapper {
     responder: Arc<Mutex<Option<oneshot::Sender<QueryResult>>>>,
 }
 
+#[cfg(feature = "python")]
 #[pyclass]
 struct BoolCallbackWrapper {
     responder: Arc<Mutex<Option<oneshot::Sender<BoolCallbackResult>>>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl BoolCallbackWrapper {
     #[pyo3(signature = (result, message=None, severity=None, sqlstate=None))]
@@ -170,6 +210,7 @@ impl BoolCallbackWrapper {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl CallbackWrapper {
     #[pyo3(signature = (result, *, is_tag=false, is_error=false))]
@@ -813,11 +854,13 @@ mod encode_tests {
     }
 }
 
+#[cfg(feature = "python")]
 pub struct PythonWorker {
     sender: Sender<WorkerMessage>,
     auth_cb: Arc<Mutex<Option<Py<PyAny>>>>,
 }
 
+#[cfg(feature = "python")]
 impl PythonWorker {
     fn new(
         query_cb: Arc<Mutex<Option<Py<PyAny>>>>,
@@ -1195,8 +1238,47 @@ impl PythonWorker {
     }
 }
 
+/// The Python worker, as a set of lifecycle hooks.
+///
+/// Thin delegation to its own methods: the worker already spoke this shape, it
+/// simply was not named. Naming it is what lets `RiffqProcessor` stop knowing
+/// about interpreters.
+#[cfg(feature = "python")]
 #[async_trait]
-trait QueryRunner: Send + Sync {
+impl SessionHooks for PythonWorker {
+    async fn on_connect(
+        &self,
+        connection_id: u64,
+        ip: String,
+        port: u16,
+        server_name: Option<&str>,
+    ) -> BoolCallbackResult {
+        PythonWorker::on_connect(self, connection_id, ip, port, server_name).await
+    }
+
+    fn authentication_enabled(&self) -> bool {
+        PythonWorker::authentication_enabled(self)
+    }
+
+    async fn on_authentication(
+        &self,
+        connection_id: u64,
+        user: Option<String>,
+        database: Option<String>,
+        host: String,
+        password: String,
+    ) -> BoolCallbackResult {
+        PythonWorker::on_authentication(self, connection_id, user, database, host, password).await
+    }
+
+    async fn on_disconnect(&self, connection_id: u64, ip: String, port: u16) {
+        PythonWorker::on_disconnect(self, connection_id, ip, port).await
+    }
+}
+
+/// What answers a query. Implement this to put an engine behind the wire.
+#[async_trait]
+pub trait QueryRunner: Send + Sync {
     async fn execute(
         &self,
         query: String,
@@ -1216,7 +1298,7 @@ pub enum QueryResult {
 }
 
 #[derive(Debug)]
-struct UserQueryError(Box<ErrorInfo>);
+pub struct UserQueryError(pub Box<ErrorInfo>);
 
 impl std::fmt::Display for UserQueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1226,11 +1308,13 @@ impl std::fmt::Display for UserQueryError {
 
 impl std::error::Error for UserQueryError {}
 
+#[cfg(feature = "python")]
 struct RouterQueryRunner {
     py_worker: Arc<PythonWorker>,
     catalog_ctx: Arc<Mutex<Arc<SessionContext>>>,
 }
 
+#[cfg(feature = "python")]
 #[async_trait]
 impl QueryRunner for RouterQueryRunner {
     async fn execute(
@@ -1292,10 +1376,12 @@ impl QueryRunner for RouterQueryRunner {
     }
 }
 
+#[cfg(feature = "python")]
 struct DirectQueryRunner {
     py_worker: Arc<PythonWorker>,
 }
 
+#[cfg(feature = "python")]
 #[async_trait]
 impl QueryRunner for DirectQueryRunner {
     async fn execute(
@@ -1317,7 +1403,7 @@ impl QueryRunner for DirectQueryRunner {
 }
 
 pub struct RiffqProcessor {
-    py_worker: Arc<PythonWorker>,
+    hooks: Arc<dyn SessionHooks>,
     conn_id_sender: Arc<Mutex<Option<oneshot::Sender<u64>>>>,
     query_runner: Arc<dyn QueryRunner>,
     ctx_map: Arc<HashMap<String, Arc<SessionContext>>>,
@@ -1501,7 +1587,7 @@ impl StartupHandler for RiffqProcessor {
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
-                if self.py_worker.authentication_enabled() {
+                if self.hooks.authentication_enabled() {
                     client.set_state(PgWireConnectionState::AuthenticationInProgress);
                     client
                         .send(PgWireBackendMessage::Authentication(
@@ -1519,7 +1605,7 @@ impl StartupHandler for RiffqProcessor {
                     let addr = client.socket_addr();
                     // Obtain server_name (SNI) via pgwire ClientInfo helper
                     let allowed = self
-                        .py_worker
+                        .hooks
                         .on_connect(
                             id,
                             addr.ip().to_string(),
@@ -1557,7 +1643,7 @@ impl StartupHandler for RiffqProcessor {
 
                 let login_info = pgwire::api::auth::LoginInfo::from_client_info(client);
                 let allowed = self
-                    .py_worker
+                    .hooks
                     .on_authentication(
                         id,
                         login_info.user().map(|s| s.to_string()),
@@ -1584,7 +1670,7 @@ impl StartupHandler for RiffqProcessor {
 
                 let addr = client.socket_addr();
                 let allowed = self
-                    .py_worker
+                    .hooks
                     .on_connect(
                         id,
                         addr.ip().to_string(),
@@ -2023,7 +2109,7 @@ async fn detect_gssencmode(mut socket: TcpStream) -> Option<TcpStream> {
     Some(socket)
 }
 
-fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
+pub fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
     let cert = certs(&mut BufReader::new(File::open(cert_path)?))
         .collect::<Result<Vec<CertificateDer>, IOError>>()?;
 
@@ -2060,7 +2146,7 @@ fn setup_tls(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, IOError> {
 /// primary/unique constraint on `confrelid` whose `conkey` matches the foreign
 /// key's `confkey`. This view is installed over the registered one after the
 /// session context is built.
-const REFERENTIAL_CONSTRAINTS_VIEW: &str = r#"
+pub const REFERENTIAL_CONSTRAINTS_VIEW: &str = r#"
 CREATE OR REPLACE VIEW information_schema.referential_constraints AS
 SELECT '{catalog}'      AS constraint_catalog,
        ncon.nspname       AS constraint_schema,
@@ -2095,7 +2181,7 @@ LEFT JOIN pg_catalog.pg_namespace npkc ON pkc.connamespace = npkc.oid
 /// `catalog` is substituted for the catalog-name columns rather than calling
 /// `current_database()`: that function is resolved per client query, so it is
 /// not available while planning a `CREATE VIEW` body at startup.
-async fn install_referential_constraints_view(ctx: &SessionContext, catalog: &str) {
+pub async fn install_referential_constraints_view(ctx: &SessionContext, catalog: &str) {
     let sql = REFERENTIAL_CONSTRAINTS_VIEW.replace("{catalog}", catalog);
     match ctx.sql(&sql).await {
         Ok(df) => match df.collect().await {
@@ -2109,6 +2195,7 @@ async fn install_referential_constraints_view(ctx: &SessionContext, catalog: &st
 /// Convert a Python exception raised by a lazy catalog source into a
 /// `DataFusionError`, so the failure propagates to the SQL client instead of
 /// being swallowed (the lazy catalog contract forbids failing silently).
+#[cfg(feature = "python")]
 fn py_to_df(e: PyErr) -> DataFusionError {
     DataFusionError::Execution(format!("lazy catalog source error: {e}"))
 }
@@ -2117,11 +2204,13 @@ fn py_to_df(e: PyErr) -> DataFusionError {
 /// Python source calls it with the list of rows it produced; we capture that
 /// list so the surrounding Rust method can marshal it. Mirrors the
 /// `&mut dyn FnMut(Vec<...>)` callback of the Rust `LazyCatalogSource` trait.
+#[cfg(feature = "python")]
 #[pyclass]
 struct CatalogCallback {
     rows: Arc<Mutex<Option<Py<PyAny>>>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl CatalogCallback {
     /// Record the rows the Python source passed in. Expected to be invoked once,
@@ -2132,6 +2221,7 @@ impl CatalogCallback {
 }
 
 /// Read a required integer field from a row dict.
+#[cfg(feature = "python")]
 fn req_i32(d: &Bound<'_, PyDict>, key: &str) -> DFResult<i32> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) => v.extract::<i32>().map_err(py_to_df),
@@ -2142,6 +2232,7 @@ fn req_i32(d: &Bound<'_, PyDict>, key: &str) -> DFResult<i32> {
 }
 
 /// Read a required string field from a row dict.
+#[cfg(feature = "python")]
 fn req_str(d: &Bound<'_, PyDict>, key: &str) -> DFResult<String> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) => v.extract::<String>().map_err(py_to_df),
@@ -2152,6 +2243,7 @@ fn req_str(d: &Bound<'_, PyDict>, key: &str) -> DFResult<String> {
 }
 
 /// Read a required boolean field from a row dict.
+#[cfg(feature = "python")]
 fn req_bool(d: &Bound<'_, PyDict>, key: &str) -> DFResult<bool> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) => v.extract::<bool>().map_err(py_to_df),
@@ -2162,6 +2254,7 @@ fn req_bool(d: &Bound<'_, PyDict>, key: &str) -> DFResult<bool> {
 }
 
 /// Read an optional integer field from a row dict (absent or `None` -> `None`).
+#[cfg(feature = "python")]
 fn opt_i32(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Option<i32>> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) if !v.is_none() => Ok(Some(v.extract::<i32>().map_err(py_to_df)?)),
@@ -2170,6 +2263,7 @@ fn opt_i32(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Option<i32>> {
 }
 
 /// Read an optional string field from a row dict (absent or `None` -> `None`).
+#[cfg(feature = "python")]
 fn opt_str(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Option<String>> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) if !v.is_none() => Ok(Some(v.extract::<String>().map_err(py_to_df)?)),
@@ -2179,6 +2273,7 @@ fn opt_str(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Option<String>> {
 
 /// Read an optional boolean field from a row dict, defaulting to `default` when
 /// absent or `None`.
+#[cfg(feature = "python")]
 fn opt_bool_or(d: &Bound<'_, PyDict>, key: &str, default: bool) -> DFResult<bool> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) if !v.is_none() => v.extract::<bool>().map_err(py_to_df),
@@ -2187,6 +2282,7 @@ fn opt_bool_or(d: &Bound<'_, PyDict>, key: &str, default: bool) -> DFResult<bool
 }
 
 /// Read a required list-of-integers field from a row dict (e.g. key attnums).
+#[cfg(feature = "python")]
 fn req_i32_list(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Vec<i32>> {
     match d.get_item(key).map_err(py_to_df)? {
         Some(v) => v.extract::<Vec<i32>>().map_err(py_to_df),
@@ -2197,6 +2293,7 @@ fn req_i32_list(d: &Bound<'_, PyDict>, key: &str) -> DFResult<Vec<i32>> {
 }
 
 /// Downcast the Python value a source returned into a list of row dicts.
+#[cfg(feature = "python")]
 fn row_dicts<'py>(method: &str, list: &Bound<'py, PyAny>) -> DFResult<Vec<Bound<'py, PyDict>>> {
     let list: &Bound<'py, PyList> = list.cast().map_err(|e| {
         DataFusionError::Execution(format!("{method}() must pass a list of dicts: {e}"))
@@ -2212,6 +2309,7 @@ fn row_dicts<'py>(method: &str, list: &Bound<'py, PyAny>) -> DFResult<Vec<Bound<
 }
 
 /// Parse `databases()` rows: `{oid, name, [datdba]}` -> [`DatabaseDef`].
+#[cfg(feature = "python")]
 fn parse_databases(list: &Bound<'_, PyAny>) -> DFResult<Vec<DatabaseDef>> {
     row_dicts("databases", list)?
         .iter()
@@ -2225,6 +2323,7 @@ fn parse_databases(list: &Bound<'_, PyAny>) -> DFResult<Vec<DatabaseDef>> {
 }
 
 /// Parse `schemas()` rows: `{oid, name, [owner_oid]}` -> [`SchemaDef`].
+#[cfg(feature = "python")]
 fn parse_schemas(list: &Bound<'_, PyAny>) -> DFResult<Vec<SchemaDef>> {
     row_dicts("schemas", list)?
         .iter()
@@ -2239,6 +2338,7 @@ fn parse_schemas(list: &Bound<'_, PyAny>) -> DFResult<Vec<SchemaDef>> {
 }
 
 /// Parse `relations()` rows: `{oid, reltype_oid, name, [kind]}` -> [`RelationDef`].
+#[cfg(feature = "python")]
 fn parse_relations(list: &Bound<'_, PyAny>) -> DFResult<Vec<RelationDef>> {
     row_dicts("relations", list)?
         .iter()
@@ -2269,6 +2369,7 @@ fn parse_relations(list: &Bound<'_, PyAny>) -> DFResult<Vec<RelationDef>> {
 }
 
 /// Parse `columns()` rows: `{name, type_oid, nullable}` -> [`ColumnSpec`].
+#[cfg(feature = "python")]
 fn parse_columns(list: &Bound<'_, PyAny>) -> DFResult<Vec<ColumnSpec>> {
     row_dicts("columns", list)?
         .iter()
@@ -2285,6 +2386,7 @@ fn parse_columns(list: &Bound<'_, PyAny>) -> DFResult<Vec<ColumnSpec>> {
 /// Parse `indexes()` rows:
 /// `{index_oid, index_name, table_oid, key_attnums, [is_unique], [is_primary]}`
 /// -> [`IndexDef`].
+#[cfg(feature = "python")]
 fn parse_indexes(list: &Bound<'_, PyAny>) -> DFResult<Vec<IndexDef>> {
     row_dicts("indexes", list)?
         .iter()
@@ -2303,6 +2405,7 @@ fn parse_indexes(list: &Bound<'_, PyAny>) -> DFResult<Vec<IndexDef>> {
 
 /// Read a foreign key referential action, accepting either the spelled-out name
 /// or the single-character `pg_constraint` code. Absent means `NO ACTION`.
+#[cfg(feature = "python")]
 fn fk_action(d: &Bound<'_, PyDict>, key: &str) -> DFResult<ForeignKeyAction> {
     Ok(match opt_str(d, key)?.as_deref() {
         None | Some("no_action") | Some("a") => ForeignKeyAction::NoAction,
@@ -2322,6 +2425,7 @@ fn fk_action(d: &Bound<'_, PyDict>, key: &str) -> DFResult<ForeignKeyAction> {
 /// `{oid, name, kind, namespace_oid, table_oid, key_attnums, [index_oid],
 ///   [referenced_table_oid], [referenced_key_attnums], [on_update], [on_delete]}`
 /// -> [`ConstraintDef`].
+#[cfg(feature = "python")]
 fn parse_constraints(list: &Bound<'_, PyAny>) -> DFResult<Vec<ConstraintDef>> {
     row_dicts("constraints", list)?
         .iter()
@@ -2373,6 +2477,7 @@ fn parse_constraints(list: &Bound<'_, PyAny>) -> DFResult<Vec<ConstraintDef>> {
 }
 
 /// Parse `config()` rows: `{name, setting}` -> [`ConfigSettingDef`] (pg_config).
+#[cfg(feature = "python")]
 fn parse_config(list: &Bound<'_, PyAny>) -> DFResult<Vec<ConfigSettingDef>> {
     row_dicts("config", list)?
         .iter()
@@ -2386,6 +2491,7 @@ fn parse_config(list: &Bound<'_, PyAny>) -> DFResult<Vec<ConfigSettingDef>> {
 }
 
 /// Parse `settings()` rows: `{name, setting}` -> [`SettingDef`] (pg_settings).
+#[cfg(feature = "python")]
 fn parse_settings(list: &Bound<'_, PyAny>) -> DFResult<Vec<SettingDef>> {
     row_dicts("settings", list)?
         .iter()
@@ -2404,10 +2510,12 @@ fn parse_settings(list: &Bound<'_, PyAny>) -> DFResult<Vec<SettingDef>> {
 /// Python a [`CatalogCallback`], and marshals the captured rows into the
 /// pg_catalog definition types. Errors raised in Python surface as
 /// `DataFusionError` to the SQL client.
+#[cfg(feature = "python")]
 struct PyLazyCatalogSource {
     obj: Py<PyAny>,
 }
 
+#[cfg(feature = "python")]
 impl PyLazyCatalogSource {
     /// Call `method` on the Python source with `str_args` followed by a fresh
     /// callback, returning whatever list the callback captured (or `None` if the
@@ -2433,6 +2541,7 @@ impl PyLazyCatalogSource {
     }
 }
 
+#[cfg(feature = "python")]
 impl LazyCatalogSource for PyLazyCatalogSource {
     fn databases(&self, callback: &mut dyn FnMut(Vec<DatabaseDef>)) -> DFResult<()> {
         let defs = Python::attach(|py| -> DFResult<Vec<DatabaseDef>> {
@@ -2560,6 +2669,110 @@ impl LazyCatalogSource for PyLazyCatalogSource {
     }
 }
 
+
+/// Serve pgwire on `addr` until a shutdown signal arrives.
+///
+/// Lifted out of the `Server` pyclass so that it is reachable without one.
+/// Everything a consumer has to decide is an argument: what answers a query
+/// (`make_runner`, called once per connection so a runner may hold that
+/// connection's context), what the connection lifecycle is reported to
+/// (`hooks`), and what the catalog looks like (`ctx_map`).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve(
+    addr: &str,
+    tls_acceptor: Option<TlsAcceptor>,
+    hooks: Arc<dyn SessionHooks>,
+    ctx_map: Arc<HashMap<String, Arc<SessionContext>>>,
+    default_ctx: Arc<SessionContext>,
+    server_version: String,
+    make_runner: Arc<dyn Fn(Arc<SessionContext>) -> Arc<dyn QueryRunner> + Send + Sync>,
+) -> std::io::Result<()> {
+    let listener = bind_listener(addr)?;
+    info!("Listening on {}", addr);
+
+    let server_task = tokio::spawn({
+        let hooks = hooks.clone();
+        let make_runner = make_runner.clone();
+        let ctx_map = ctx_map.clone();
+        let default_ctx = default_ctx.clone();
+        let server_version = server_version.clone();
+        async move {
+            loop {
+                // accept() fails transiently (EMFILE/ENFILE on fd
+                // exhaustion, ECONNABORTED, ...). Panicking here via
+                // unwrap() killed the accept task and dropped the
+                // listener: the process kept running but the port
+                // stayed dead until a restart.
+                let (socket, addr) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!("Failed to accept connection: {:?}; retrying", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                {
+                    let conn_ctx =
+                        SessionContext::new_with_state(default_ctx.state().clone());
+                    let conn_ctx = Arc::new(conn_ctx);
+
+                    // Per connection, not per server: a runner may want to
+                    // hold that connection's own context.
+                    let query_runner: Arc<dyn QueryRunner> = make_runner(conn_ctx.clone());
+
+                    let tls_acceptor_ref = tls_acceptor.clone();
+                    let (id_tx, id_rx) = oneshot::channel();
+
+                    let handler = Arc::new(RiffqProcessor {
+                        ctx: Arc::new(Mutex::new(conn_ctx.clone())),
+                        ctx_map: ctx_map.clone(),
+                        hooks: hooks.clone(),
+                        conn_id_sender: Arc::new(Mutex::new(Some(id_tx))),
+                        query_runner: query_runner.clone(),
+                        server_version: server_version.clone(),
+                    });
+                    let factory = Arc::new(RiffqProcessorFactory {
+                        handler: handler.clone(),
+                        extended_handler: handler.clone(),
+                    });
+
+                    let hooks_clone = hooks.clone();
+                    let ip = addr.ip().to_string();
+                    let port = addr.port();
+
+                    tokio::spawn(async move {
+                        // detect_gssencmode waits for the client's first
+                        // bytes, so it must run inside the per-connection
+                        // task. When it was awaited inline in the accept
+                        // loop, a single client that connected and never
+                        // sent anything blocked ALL accepts: the kernel
+                        // kept completing handshakes into the listen
+                        // backlog, but no connection was ever served.
+                        let socket = match detect_gssencmode(socket).await {
+                            Some(socket) => socket,
+                            None => return,
+                        };
+                        if let Err(e) =
+                            process_socket(socket, tls_acceptor_ref, factory).await
+                        {
+                            error!("process_socket error: {:?}", e);
+                        }
+                        let connection_id = id_rx.await.unwrap_or(0);
+                        hooks_clone.on_disconnect(connection_id, ip, port).await;
+                    });
+                }
+            }
+        }
+    });
+
+    wait_for_shutdown_signal().await;
+    info!("Shutting down server");
+    server_task.abort();
+
+    Ok(())
+}
+
+#[cfg(feature = "python")]
 #[pyclass]
 pub struct Server {
     addr: String,
@@ -2575,6 +2788,7 @@ pub struct Server {
     lazy_catalog_source: Arc<Mutex<Option<Py<PyAny>>>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl Server {
     #[new]
@@ -2816,100 +3030,34 @@ impl Server {
             }
 
             let ctx_map = Arc::new(ctx_map);
+            let runner_worker = py_worker.clone();
             let default_ctx = ctx_map.values().next().unwrap().clone();
 
-            let listener = bind_listener(&addr)?;
-            info!("Listening on {}", addr);
-
-            let server_task = tokio::spawn({
-                let tls_acceptor = if tls {
+            serve(
+                &addr,
+                if tls {
                     self.tls_acceptor.lock().unwrap().clone()
                 } else {
                     None
-                };
-                let py_worker = py_worker.clone();
-                let ctx_map = ctx_map.clone();
-                let default_ctx = default_ctx.clone();
-                let server_version = server_version.clone();
-                async move {
-                    loop {
-                        // accept() fails transiently (EMFILE/ENFILE on fd
-                        // exhaustion, ECONNABORTED, ...). Panicking here via
-                        // unwrap() killed the accept task and dropped the
-                        // listener: the process kept running but the port
-                        // stayed dead until a restart.
-                        let (socket, addr) = match listener.accept().await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                error!("Failed to accept connection: {:?}; retrying", e);
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                continue;
-                            }
-                        };
-                        {
-                            let conn_ctx =
-                                SessionContext::new_with_state(default_ctx.state().clone());
-                            let conn_ctx = Arc::new(conn_ctx);
-
-                            let query_runner: Arc<dyn QueryRunner> = if catalog_emulation {
-                                Arc::new(RouterQueryRunner {
-                                    py_worker: py_worker.clone(),
-                                    catalog_ctx: Arc::new(Mutex::new(conn_ctx.clone())),
-                                })
-                            } else {
-                                Arc::new(DirectQueryRunner {
-                                    py_worker: py_worker.clone(),
-                                })
-                            };
-
-                            let tls_acceptor_ref = tls_acceptor.clone();
-                            let (id_tx, id_rx) = oneshot::channel();
-
-                            let handler = Arc::new(RiffqProcessor {
-                                ctx: Arc::new(Mutex::new(conn_ctx.clone())),
-                                ctx_map: ctx_map.clone(),
-                                py_worker: py_worker.clone(),
-                                conn_id_sender: Arc::new(Mutex::new(Some(id_tx))),
-                                query_runner: query_runner.clone(),
-                                server_version: server_version.clone(),
-                            });
-                            let factory = Arc::new(RiffqProcessorFactory {
-                                handler: handler.clone(),
-                                extended_handler: handler.clone(),
-                            });
-
-                            let py_worker_clone = py_worker.clone();
-                            let ip = addr.ip().to_string();
-                            let port = addr.port();
-
-                            tokio::spawn(async move {
-                                // detect_gssencmode waits for the client's first
-                                // bytes, so it must run inside the per-connection
-                                // task. When it was awaited inline in the accept
-                                // loop, a single client that connected and never
-                                // sent anything blocked ALL accepts: the kernel
-                                // kept completing handshakes into the listen
-                                // backlog, but no connection was ever served.
-                                let socket = match detect_gssencmode(socket).await {
-                                    Some(socket) => socket,
-                                    None => return,
-                                };
-                                if let Err(e) =
-                                    process_socket(socket, tls_acceptor_ref, factory).await
-                                {
-                                    error!("process_socket error: {:?}", e);
-                                }
-                                let connection_id = id_rx.await.unwrap_or(0);
-                                py_worker_clone.on_disconnect(connection_id, ip, port).await;
-                            });
-                        }
+                },
+                py_worker.clone(),
+                ctx_map,
+                default_ctx,
+                server_version.clone(),
+                Arc::new(move |conn_ctx: Arc<SessionContext>| {
+                    if catalog_emulation {
+                        Arc::new(RouterQueryRunner {
+                            py_worker: runner_worker.clone(),
+                            catalog_ctx: Arc::new(Mutex::new(conn_ctx)),
+                        }) as Arc<dyn QueryRunner>
+                    } else {
+                        Arc::new(DirectQueryRunner {
+                            py_worker: runner_worker.clone(),
+                        }) as Arc<dyn QueryRunner>
                     }
-                }
-            });
-
-            wait_for_shutdown_signal().await;
-            info!("Shutting down server");
-            server_task.abort();
+                }),
+            )
+            .await?;
             run_shutdown_callback(&shutdown_cb);
             Ok(())
         })
@@ -2978,6 +3126,7 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+#[cfg(feature = "python")]
 fn run_shutdown_callback(shutdown_cb: &Arc<Mutex<Option<Py<PyAny>>>>) {
     // Invokes the python handle_shutdown callback (if any), reacquiring the GIL
     // released by start()'s allow_threads. Errors are logged, not panicked, so
@@ -2998,6 +3147,7 @@ fn run_shutdown_callback(shutdown_cb: &Arc<Mutex<Option<Py<PyAny>>>>) {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn _riffq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
